@@ -682,3 +682,83 @@ are marked **(adapted)**.
   instead of the global constant. UI: hold the track's arm key + Knob Y,
   or the REC page volume columns while Overdub mode is on (decide at
   implementation, keeping 8x8 in mind).
+
+## 15. Part F: norns-style record flow (supersedes Part E's UI)
+
+User request: work like mlr/mlre on norns. The input is always heard, and
+one action records: no "arm + switch".
+
+### F1. Monitor modes: Off / Armed / Always (extends Part B)
+- `mlr_monitor_mode`: `MLR_MON_OFF` (0), `MLR_MON_ARMED` (1, today's
+  behaviour), `MLR_MON_ALWAYS` (2, norns-like).
+- DELETE + REC page key cycles Always → Armed → Off → Always. Flash on the
+  key: Always = 3 quick, Armed = 2 quick, Off = 1 long.
+- **Always**: the dry input is mixed to the outputs all the time, scaled by
+  Knob X.
+  - A track armed or recording → routed exactly as today (track
+    volume/pan/channel; A+B both outputs).
+  - Nothing armed → stereo through: In 1 → Out 1, In 2 → Out 2.
+  - Changing between the two routings ramps over the existing monitor
+    fade, so there's no click.
+- Scene block: keep the `mon_version` byte. Version 1 = the bool (0 off,
+  1 armed). Version 2 stores the mode 0..2. The loader maps v1 → Off/Armed.
+- Build option: replace `MLR_MONITOR_DEFAULT_OFF` with
+  `MLR_MONITOR_DEFAULT_MODE` (0/1/2, default 1).
+- Gridless: unchanged (it monitors only while recording). Off still
+  silences it.
+
+### F2. Record flow setting: Switch (today) / Direct (norns)
+- Row 0, col 2 key (free on 16-wide and 8x8): lit = Direct, dim = Switch.
+  Saved in the scene (a new trailing versioned block). Patterns/recalls
+  never touch it.
+- **Switch flow**: exactly as today.
+- **Direct flow** (grid modes, REC page arm keys; 8x8 col 0):
+  - **Track with audio**: tap the arm key → recording starts at once (a
+    fresh recording, as `mlr_start_record` does today; with Part C later
+    it becomes an overdub when Overdub mode is on). Tap the lit key while
+    recording → stop (playback starts, as when returning the switch to
+    Middle today). Input pick as Part A: col 0 = A, col 1 = B, the two
+    keys together = A+B (the second key switches a just-started
+    recording to the sum).
+  - **Empty track**: tap → armed and *listening* (a distinct blink). The
+    first time the input passes the threshold, recording starts (F3).
+    Tap again while listening → disarm. Tap while recording → stop.
+    Auto-trigger applies to empty tracks only.
+  - The switch still works in Direct flow: Switch Up/Down starts an armed
+    or listening track as today, and quick-record (switch held + key)
+    behaves as today. Pulse In 2 gated record is unchanged.
+  - Copy gesture: unchanged (only when nothing is armed or recording). It
+    resolves on key release, so in Direct flow a single tap on a track
+    with audio starts recording on **release**, not on press. Accept this
+    and document it.
+  - Max length auto-stops as today.
+
+### F3. Threshold auto-trigger (empty tracks, Direct flow)
+- The detector works on the **raw** input of the track's source
+  (A/B/A+B), before Knob X, as mlre does (`amp_in` polls are pre rec
+  level).
+- Peak follower: |x| with ~1 ms attack / ~50 ms release, compared against
+  the threshold. Default **−18 dBFS** (|x| > 258 of 2048), as a constant
+  `MLR_AUTOREC_THRESHOLD`. Adjustable later (mlre range −40..0 dB).
+- Hold-off: 50 ms after arming.
+- **Pre-roll**: the record path reads the input through a 10 ms delay
+  line (240 samples, `int16_t`, 480 B). It's always in the record path,
+  so every start includes 10 ms of lead-in and the triggering attack is
+  kept. The monitor uses the live input.
+- Cost: ~10-15 cycles per sample, +480 B RAM.
+
+### Tests
+1. Switch flow + Monitor Armed: identical to before.
+2. Monitor Always, nothing armed: In 1 → Out 1, In 2 → Out 2, level on
+   Knob X. Arm a track → routing follows the track without a click. Off →
+   silent.
+3. Direct flow, a track with audio: tap → recording starts (on release),
+   tap → stops and plays. Both keys → A+B.
+4. Direct flow, an empty track: tap → listening, silence doesn't trigger,
+   a note triggers with the attack intact (pre-roll), tap → stop. Tap
+   while listening → disarm.
+5. The switch and Pulse In 2 still work in Direct flow.
+6. The settings persist across power cycles. An old scene loads as Switch
+   flow + Monitor Armed. 8x8 works (col 2 key, col 0 arm).
+7. Gridless unchanged.
+8. Perf: no change in max process time.
