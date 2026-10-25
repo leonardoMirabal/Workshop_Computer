@@ -449,6 +449,42 @@ extern volatile uint8_t mlr_monitor_mode;
 #define MLR_REC_FLOW_SWITCH    0u
 #define MLR_REC_FLOW_DIRECT    1u
 extern volatile uint8_t mlr_rec_flow;
+
+/* Record mode (scene): Replace = a take records the track from scratch;
+ * Overdub = a take on a track with audio layers the input over it, in
+ * place, in whole-track passes (16-wide grids; 8x8 and gridless always
+ * replace). mlr_dub_q8 is how much of the old audio each pass keeps, Q8
+ * (256 = all of it, 0 = the pass overwrites). */
+#define MLR_REC_REPLACE        0u
+#define MLR_REC_OVERDUB        1u
+#define MLR_DUB_SLOTS          5
+#define MLR_DUB_DEFAULT_Q8     230u   /* ~90 % */
+extern volatile uint8_t  mlr_rec_overdub;
+extern volatile uint16_t mlr_dub_q8;
+uint16_t mlr_dub_slot_q8(int slot);        /* slot 0..4 = 0 / 50 / 75 / 90 / 100 % */
+int      mlr_dub_q8_slot(uint16_t q8);     /* nearest slot */
+
+/* Overdub session (core 0). mlr_overdub_start() begins one: Wait until
+ * playback reaches sample 0 (a stopped track starts from 0 at once), then
+ * Active passes, each re-encoding the whole track with
+ * new = old * dub + input. mlr_stop_record() turns Active into Finish (the
+ * rest of the pass is re-encoded with dub 100 % and no input) and cancels a
+ * Wait. At the wrap after Finish the header is written once. While Wait or
+ * Active, cuts, stops and loop/speed/reverse changes to the track are
+ * ignored; during Finish they commit at once (a junction: new audio up to
+ * the commit point, the previous audio after it). */
+#define MLR_OD_IDLE            0u
+#define MLR_OD_WAIT            1u
+#define MLR_OD_ACTIVE          2u
+#define MLR_OD_FINISH          3u
+#define MLR_OD_MIN_SAMPLES     (2u * MLR_SAMPLE_RATE_HZ)  /* refill lead + page backlog must fit */
+extern volatile int     mlr_od_track;   /* session track, -1 = none */
+extern volatile uint8_t mlr_od_state;   /* MLR_OD_* */
+extern int16_t          mlr_od_input;   /* core 0: this sample's input (12-bit, Knob X applied),
+                                         * set before mlr_play_mix_dual() while Active */
+bool     mlr_overdub_allowed(int track);  /* 1x forward, no loop/rotation/gate, >= 2 s, idle engine */
+bool     mlr_overdub_start(int track);    /* false = refused, nothing changed */
+
 extern volatile int    mlr_recall_active;  /* currently selected recall (-1=none) */
 
 /* Per-track group-membership bitmask (see mlr.c for invariant). */
@@ -524,6 +560,15 @@ extern volatile uint32_t mlr_perf_fill_resyncs;   /* forward fill re-seeked afte
 extern volatile uint32_t mlr_perf_erase_holds;     /* erases held back for a low playback buffer */
 extern volatile uint32_t mlr_perf_erase_hold_max_us; /* longest hold */
 extern volatile uint32_t mlr_perf_erase_forced;    /* erases that went ahead at the cap */
+extern volatile uint32_t mlr_perf_rec_page_drops;  /* record samples dropped: page ring full */
+/* Overdub diagnostics. */
+extern volatile uint32_t mlr_perf_overdub_passes;       /* passes completed */
+extern volatile uint32_t mlr_perf_overdub_commits;      /* sessions committed at a wrap */
+extern volatile uint32_t mlr_perf_overdub_junctions;    /* sessions committed early (junction) */
+extern volatile uint32_t mlr_perf_overdub_starves;      /* ...of which: playback ring ran dry */
+extern volatile uint32_t mlr_perf_overdub_overflows;    /* ...of which: page ring full */
+extern volatile uint32_t mlr_perf_overdub_erase_holds;  /* erases held: refill not past the sector */
+extern volatile uint32_t mlr_perf_overdub_ring_max;     /* most pages queued during overdub */
 void mlr_perf_reset(void);
 void mlr_perf_count_grid_frame_drop(void);
 void mlr_perf_count_monome_ws_event_drop(void);

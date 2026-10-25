@@ -165,6 +165,11 @@ from grid mode (hold DELETE and press the REC key, see
 monitors while you record, as described above. With the monitor off, nothing from
 the inputs reaches the outputs while you record. Knob X still sets the record gain.
 
+Recording in gridless mode always replaces the track. The
+[Overdub](https://github.com/TomWhitwell/Workshop_Computer/blob/main/releases/15_MLRws/panels/grid.md#overdub)
+record mode is set and used on 16-wide grids only; gridless ignores the saved
+setting.
+
 The MLRws sample-manager web app still works in gridless mode: just plug the
 Computer into a computer running the web app and MLRws will silently switch
 into sample-manager mode for the duration of the connection, then return to

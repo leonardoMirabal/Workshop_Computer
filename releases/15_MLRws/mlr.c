@@ -49,6 +49,11 @@ volatile uint8_t mlr_cv1_target = MLR_CV_TARGET_LAST;
 volatile uint8_t mlr_cv2_target = MLR_CV_TARGET_LAST;
 volatile uint8_t mlr_monitor_mode = MLR_MONITOR_DEFAULT_MODE;
 volatile uint8_t mlr_rec_flow = MLR_REC_FLOW_SWITCH;
+volatile uint8_t mlr_rec_overdub = MLR_REC_REPLACE;
+volatile uint16_t mlr_dub_q8 = MLR_DUB_DEFAULT_Q8;
+volatile int     mlr_od_track = -1;
+volatile uint8_t mlr_od_state = MLR_OD_IDLE;
+int16_t          mlr_od_input;
 volatile bool   mlr_pan_enabled = false;
 volatile int    mlr_recall_active = -1;
 static uint32_t mlr_clock_ms = 0;
@@ -115,6 +120,14 @@ volatile uint32_t mlr_perf_fill_resyncs;
 volatile uint32_t mlr_perf_erase_holds;
 volatile uint32_t mlr_perf_erase_hold_max_us;
 volatile uint32_t mlr_perf_erase_forced;
+volatile uint32_t mlr_perf_rec_page_drops;
+volatile uint32_t mlr_perf_overdub_passes;
+volatile uint32_t mlr_perf_overdub_commits;
+volatile uint32_t mlr_perf_overdub_junctions;
+volatile uint32_t mlr_perf_overdub_starves;
+volatile uint32_t mlr_perf_overdub_overflows;
+volatile uint32_t mlr_perf_overdub_erase_holds;
+volatile uint32_t mlr_perf_overdub_ring_max;
 
 static inline void perf_update_max(volatile uint32_t *dst, uint32_t value)
 {
@@ -199,6 +212,14 @@ void mlr_perf_reset(void)
 	mlr_perf_flash_program_max_us = 0;
 	mlr_perf_adc_mux_resets = 0;
 	mlr_perf_adc_fifo_level_max = 0;
+	mlr_perf_rec_page_drops = 0;
+	mlr_perf_overdub_passes = 0;
+	mlr_perf_overdub_commits = 0;
+	mlr_perf_overdub_junctions = 0;
+	mlr_perf_overdub_starves = 0;
+	mlr_perf_overdub_overflows = 0;
+	mlr_perf_overdub_erase_holds = 0;
+	mlr_perf_overdub_ring_max = 0;
 	for (int t = 0; t < MLR_NUM_TRACKS; t++) {
 		mlr_perf.pcm_ring_min[t] = MLR_RING_SAMPLES;
 		mlr_perf_pcm_ring_min[t] = MLR_RING_SAMPLES;
@@ -299,6 +320,7 @@ void mlr_perf_note_process_sample_us(uint32_t elapsed_us, bool ui_tick)
 #define PERF_FLASH_ERASE(off, bytes) perf_flash_erase((off), (bytes))
 #define PERF_FLASH_PROGRAM(off, data, bytes) perf_flash_program((off), (data), (bytes))
 #define PERF_SERVICE_RESET_REQUEST() perf_service_reset_request()
+#define PERF_COUNT(counter) (mlr_perf_##counter++)
 #else
 #define PERF_NOTE_PCM_AVAIL(track, avail) do { (void)(track); (void)(avail); } while (0)
 #define PERF_NOTE_PCM_UNDERRUN(track) do { (void)(track); } while (0)
@@ -308,6 +330,7 @@ void mlr_perf_note_process_sample_us(uint32_t elapsed_us, bool ui_tick)
 #define PERF_FLASH_ERASE(off, bytes) flash_range_erase((off), (bytes))
 #define PERF_FLASH_PROGRAM(off, data, bytes) flash_range_program((off), (data), (bytes))
 #define PERF_SERVICE_RESET_REQUEST() do { } while (0)
+#define PERF_COUNT(counter) ((void)0)
 #endif
 
 volatile uint8_t mlr_event_playback_source = MLR_PLAYBACK_SOURCE_NONE;
@@ -332,10 +355,30 @@ static adpcm_state_t  rec_enc_state[MLR_NUM_CHANNELS];
 static bool           rec_nybble_phase;
 static uint8_t        rec_pending_byte;
 
+/* Keyframe 0 of each track's header (RAM copy, so core 0 can seed an
+ * overdub encoder without reading flash). Written where the header is read
+ * or written: boot, rescan, record header, copy. */
+static adpcm_state_t  track_kf0[MLR_NUM_TRACKS];
+
+/* Overdub session. Core 0 owns the session state (mlr_od_track/state and the
+ * od_* encoder bookkeeping); core 1 owns the flash side once od_flush_track
+ * is set, and hands it back by clearing it after the header write. */
+static uint32_t       od_pass_bytes;        /* page-padded ADPCM bytes per pass */
+static uint32_t       od_passes;            /* passes completed this session */
+static uint32_t       od_kf_full;           /* keyframes of the last complete pass */
+static uint32_t       od_kf_merge;          /* rec_keyframes entries the header takes */
+static volatile int   od_flush_track = -1;  /* core 1 flushes this track in sector mode */
+static volatile bool  od_live;              /* encoding (Active/Finish): read-before-erase applies */
+static volatile bool  od_junction_pending;  /* early commit: core 1 completes the open sector from flash */
+static volatile uint32_t od_junction_sample;  /* new audio ends here (this pass) */
+static volatile bool  od_discard;           /* track cleared mid-session: drop its pages */
+static bool           od_sector_ready;      /* core 1: sector at rec_flash_offset is erased */
+
 /* Header write state */
 static volatile bool hdr_write_pending = false;
 static int           hdr_write_track   = -1;
 static bool          hdr_write_start_playback = false;
+static bool          hdr_write_od_merge = false;  /* overdub: first od_kf_merge keyframes from rec_keyframes */
 static uint8_t       hdr_rewrite_pending_mask = 0;
 
 /* Clear state */
@@ -1124,6 +1167,7 @@ void MLR_COLD_FUNC mlr_init(void)
 					tr->fill_decode[ch].step_index = hdr->keyframes[0].ch[ch].step_index;
 				}
 			}
+			track_kf0[t] = tr->fill_decode[0];
 			tr->fill_seek_pending = false;
 			tr->seek_reverse_pending = false;
 			tr->seek_start_pending = false;
@@ -1137,6 +1181,10 @@ void MLR_COLD_FUNC mlr_init(void)
 	mlr_cv1_target = mlr_cv2_target = MLR_CV_TARGET_LAST;
 	mlr_monitor_mode = MLR_MONITOR_DEFAULT_MODE;
 	mlr_rec_flow = MLR_REC_FLOW_SWITCH;
+	mlr_rec_overdub = MLR_REC_REPLACE;
+	mlr_dub_q8 = MLR_DUB_DEFAULT_Q8;
+	mlr_od_track = -1;
+	mlr_od_state = MLR_OD_IDLE;
 	for (int t = 0; t < MLR_NUM_TRACKS; t++) {
 		mlr_set_pan(t, mlr_pan_default(t));  /* until the scene says otherwise */
 		mlr_set_lpf(t, MLR_LPF_OPEN);
@@ -1218,6 +1266,7 @@ void MLR_COLD_FUNC mlr_rescan_track(int track)
 				tr->fill_decode[ch].step_index = hdr->keyframes[0].ch[ch].step_index;
 			}
 		}
+		track_kf0[track] = tr->fill_decode[0];
 	}
 
 	/* Same setters mlr_scene_load() uses; loops need content to map columns. */
@@ -1242,6 +1291,8 @@ void MLR_COLD_FUNC mlr_rescan_track(int track)
 void __not_in_flash_func(mlr_start_record)(int track)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return;
+	/* An overdub (or its finish) owns the encoder and the page ring. */
+	if (rec_track_idx >= 0 || mlr_od_state != MLR_OD_IDLE) return;
 
 	/* Recording over a grouped track removes it from its group; the rest
 	 * of the group stays grouped together. Safe for solo tracks. */
@@ -1307,12 +1358,15 @@ void __not_in_flash_func(mlr_start_record)(int track)
 	rec_num_keyframes = 1;
 }
 
-void __not_in_flash_func(mlr_record_sample)(int16_t sample)
+/* Encode one 16-bit-scale sample into the page ring. False = the ring is
+ * full (core 1 is that far behind): the sample is dropped and the encoder
+ * left as it was, so what is stored stays decodable. */
+static bool __attribute__((noinline)) __not_in_flash_func(rec_push16)(int16_t sample16)
 {
-	if (rec_track_idx < 0) return;
-
-	/* scale 12-bit to 16-bit for better ADPCM quality */
-	int16_t sample16 = sample << 4;
+	if (mlr_page_ring.fill == 0 && page_ring_used_pages() >= MLR_PAGE_RING_COUNT) {
+		PERF_COUNT(rec_page_drops);
+		return false;  /* slot w is still the page core 1 is writing */
+	}
 
 	uint8_t nybble = adpcm_encode(sample16, &rec_enc_state[0]);
 
@@ -1347,23 +1401,34 @@ void __not_in_flash_func(mlr_record_sample)(int16_t sample)
 		rec_keyframes[rec_num_keyframes].ch[0].step_index = rec_enc_state[0].step_index;
 		rec_num_keyframes++;
 	}
+	return true;
 }
 
-void __not_in_flash_func(mlr_stop_record)(void)
+void __not_in_flash_func(mlr_record_sample)(int16_t sample)
 {
-	if (rec_track_idx < 0) return;
-	mlr_track_t *tr = &mlr_tracks[rec_track_idx];
-	mlr_flushing = true;
+	if (rec_track_idx < 0 || mlr_od_state != MLR_OD_IDLE) return;  /* an overdub encodes in the mixer */
 
-	/* flush any partial nybble */
+	/* scale 12-bit to 16-bit for better ADPCM quality */
+	(void)rec_push16((int16_t)(sample << 4));
+}
+
+/* Push the partial byte and page (padded with 0xFF) so core 1 can write
+ * them. Returns how many samples are stored (rec_samples): one less if the
+ * last nybble needed a page slot and the ring was full. */
+static uint32_t __not_in_flash_func(rec_flush_partial)(void)
+{
 	if (rec_nybble_phase) {
-		uint8_t slot = mlr_page_ring.w % MLR_PAGE_RING_COUNT;
-		mlr_page_ring.pages[slot][mlr_page_ring.fill] = rec_pending_byte;
-		mlr_page_ring.fill++;
+		if (mlr_page_ring.fill == 0 && page_ring_used_pages() >= MLR_PAGE_RING_COUNT) {
+			PERF_COUNT(rec_page_drops);
+			rec_samples--;  /* odd count: no keyframe was taken after it */
+		} else {
+			uint8_t slot = mlr_page_ring.w % MLR_PAGE_RING_COUNT;
+			mlr_page_ring.pages[slot][mlr_page_ring.fill] = rec_pending_byte;
+			mlr_page_ring.fill++;
+		}
 		rec_nybble_phase = false;
 	}
 
-	/* flush partial page (pad with 0xFF) */
 	if (mlr_page_ring.fill > 0) {
 		uint8_t slot = mlr_page_ring.w % MLR_PAGE_RING_COUNT;
 		memset(&mlr_page_ring.pages[slot][mlr_page_ring.fill], 0xFF,
@@ -1373,12 +1438,38 @@ void __not_in_flash_func(mlr_stop_record)(void)
 		mlr_page_ring.w++;
 		PERF_NOTE_PAGE_RING_USED();
 	}
+	return rec_samples;
+}
+
+static void od_commit(bool junction);
+
+void __not_in_flash_func(mlr_stop_record)(void)
+{
+	if (mlr_od_state != MLR_OD_IDLE) {
+		/* Overdub: Wait never encoded anything, so it just ends; Active
+		 * mutes the input and finishes the pass at dub 100 % (od_step). */
+		if (mlr_od_state == MLR_OD_WAIT) {
+			mlr_od_state = MLR_OD_IDLE;
+			mlr_od_track = -1;
+		} else if (mlr_od_state == MLR_OD_ACTIVE) {
+			mlr_od_state = MLR_OD_FINISH;
+		}
+		mlr_rec_track = -1;
+		return;
+	}
+
+	if (rec_track_idx < 0) return;
+	mlr_track_t *tr = &mlr_tracks[rec_track_idx];
+	mlr_flushing = true;
+
+	/* flush any partial nybble and the partial page */
+	uint32_t stored = rec_flush_partial();
 
 	/* calculate actual ADPCM byte count */
-	uint32_t actual_bytes = (rec_samples + 1) / 2;  /* 2 mono samples per byte */
+	uint32_t actual_bytes = (stored + 1) / 2;  /* 2 mono samples per byte */
 
 	/* update track metadata — track becomes playable once header is written */
-	tr->length_samples = rec_samples;
+	tr->length_samples = stored;
 	tr->length_bytes   = actual_bytes;
 	tr->num_keyframes  = rec_num_keyframes;  /* keyframes stay in rec_keyframes until the header write */
 
@@ -1388,6 +1479,236 @@ void __not_in_flash_func(mlr_stop_record)(void)
 
 	rec_track_idx = -1;
 	mlr_rec_track = -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Overdub — whole-track passes, re-encoded in place (core 0)         */
+/* ------------------------------------------------------------------ */
+/*
+ * The mixer consumes the overdub track's ring one stored sample per output
+ * sample (1x, forward) and encodes new = sat12(old * dub + input) at that
+ * moment, so the new audio lands exactly on the old with no drift. A pass
+ * runs from sample 0 to the end; at the wrap the encoder restarts from the
+ * track's keyframe 0 for the next pass (the fill decoder reloads it there).
+ *
+ * Flash (core 1, flush_od_page): a sector is erased only once all of its
+ * new pages are queued, so (a) the refill has read all of its old audio
+ * (playback consumed it) and (b) an early commit can complete the open
+ * sector from the old flash data. The header is written once, at the end.
+ */
+
+uint16_t __not_in_flash_func(mlr_dub_slot_q8)(int slot)
+{
+	static const uint16_t kDubQ8[MLR_DUB_SLOTS] = { 0, 128, 192, 230, 256 };
+	if (slot < 0) slot = 0;
+	if (slot >= MLR_DUB_SLOTS) slot = MLR_DUB_SLOTS - 1;
+	return kDubQ8[slot];
+}
+
+int __not_in_flash_func(mlr_dub_q8_slot)(uint16_t q8)
+{
+	int best = 0;
+	uint16_t best_d = 0xFFFF;
+	for (int i = 0; i < MLR_DUB_SLOTS; i++) {
+		uint16_t v = mlr_dub_slot_q8(i);
+		uint16_t d = (uint16_t)(v > q8 ? v - q8 : q8 - v);
+		if (d < best_d) { best_d = d; best = i; }
+	}
+	return best;
+}
+
+/* The track can take a pass: 1x forward over the whole, unrotated track. */
+static bool __attribute__((noinline)) __not_in_flash_func(od_track_ok)(int t)
+{
+	const mlr_track_t *tr = &mlr_tracks[t];
+	return tr->has_content &&
+	       tr->length_samples >= MLR_OD_MIN_SAMPLES &&
+	       tr->length_samples <= MLR_MAX_SAMPLES &&
+	       tr->length_bytes >= (tr->length_samples + 1u) / 2u &&
+	       tr->speed_frac == 256 && !tr->reverse &&
+	       !tr->seek_reverse_pending && !tr->seek_handoff_reverse_pending &&
+	       !tr->loop_active && tr->splice_q16 == 0 && tr->fill_rot == 0 &&
+	       !mlr_gate_mode[t];
+}
+
+bool __not_in_flash_func(mlr_overdub_allowed)(int track)
+{
+	if (track < 0 || track >= MLR_NUM_TRACKS) return false;
+	if (mlr_od_state != MLR_OD_IDLE || rec_track_idx >= 0 || mlr_rec_track >= 0 ||
+	    mlr_flushing || mlr_copying)
+		return false;
+	return od_track_ok(track);
+}
+
+bool __not_in_flash_func(mlr_overdub_start)(int track)
+{
+	if (!mlr_overdub_allowed(track)) return false;
+	mlr_track_t *tr = &mlr_tracks[track];
+
+	/* Core 1 stops rotating and previewing this track's wraps (the wrap
+	 * crossfade skips samples the pass must encode) before any seek below. */
+	mlr_od_track = track;
+	__dmb();
+	mlr_od_state = MLR_OD_WAIT;
+	mlr_rec_track = track;
+	if (tr->wrap_preview_ready) {
+		tr->wrap_preview_ready = false;
+		transition_update_track_state(tr);
+	}
+	/* Stopped: play from 0, and the pass starts with it. Playing: the pass
+	 * starts at the next wrap (od_try_begin). */
+	if (!tr->playing || tr->stop_pending)
+		trigger_track_fade_and_seek(tr, 0, true);
+	return true;
+}
+
+/* Fresh encoder at sample 0, seeded from the track's keyframe 0 so the
+ * fill decoder (which reloads keyframe 0 at every wrap) stays in step. */
+static void __not_in_flash_func(od_pass_reset)(int t)
+{
+	rec_enc_state[0] = track_kf0[t];
+	rec_nybble_phase = false;
+	rec_pending_byte = 0;
+	rec_samples = 0;
+	rec_keyframes[0].ch[0].predictor  = track_kf0[t].predictor;
+	rec_keyframes[0].ch[0].step_index = track_kf0[t].step_index;
+	rec_num_keyframes = 1;
+}
+
+/* Wait -> Active: playback is about to consume sample 0. */
+static void __attribute__((noinline)) __not_in_flash_func(od_try_begin)(int t, mlr_track_t *tr, uint8_t flags)
+{
+	if (tr->playhead != 0 || tr->stop_pending || tr->speed_accum != 0 ||
+	    (flags & (MLR_TRANS_HANDOFF | MLR_TRANS_XFADE)) || tr->fill_seek_pending ||
+	    tr->pcm.w == tr->pcm.r)
+		return;
+	/* Core 1 busy with other flash work (a settings save, say): try at the
+	 * next wrap. */
+	if (mlr_flushing || mlr_scene_saving || rec_track_idx >= 0 || od_flush_track >= 0 ||
+	    mlr_page_ring.r != mlr_page_ring.w)
+		return;
+	if (!od_track_ok(t)) {  /* can't happen while the setters hold, but never encode off 1x */
+		mlr_od_state = MLR_OD_IDLE;
+		mlr_od_track = -1;
+		mlr_rec_track = -1;
+		return;
+	}
+
+	/* Core 1 is idle on recording (ring empty, no session), so core 0 sets
+	 * up the flash side here, then hands it over with od_flush_track. The
+	 * ring indices stay as they are (r == w): zeroing them one at a time
+	 * would show core 1 a moment of r != w. */
+	mlr_page_ring.fill = 0;
+	od_pass_bytes = (((tr->length_samples + 1u) >> 1) + MLR_PAGE_SIZE - 1u) & ~(uint32_t)(MLR_PAGE_SIZE - 1u);
+	rec_flash_offset = track_audio_flash_off(t);
+	od_sector_ready = false;
+	od_junction_pending = false;
+	od_discard = false;
+	od_passes = 0;
+	od_kf_full = 0;
+	rec_bytes = 0;
+	od_pass_reset(t);
+	od_live = true;
+	__dmb();
+	od_flush_track = t;
+	__dmb();
+	rec_track_idx = t;
+	mlr_od_state = MLR_OD_ACTIVE;
+}
+
+/* End the session and queue the header (written once, after the last page).
+ * junction: the pass stopped at rec_samples; core 1 keeps the old audio
+ * after that point. Merged keyframes: this pass's up to there, the previous
+ * pass's (or, in the first pass, the old header's) after it. */
+static void __attribute__((noinline)) __not_in_flash_func(od_commit)(bool junction)
+{
+	int t = rec_track_idx;
+	uint32_t x = rec_flush_partial();
+	if (junction) {
+		od_junction_sample = x;
+		__dmb();
+		od_junction_pending = true;
+		PERF_COUNT(overdub_junctions);
+	} else {
+		PERF_COUNT(overdub_commits);
+	}
+	od_kf_merge = rec_num_keyframes > od_kf_full ? rec_num_keyframes : od_kf_full;
+	od_live = false;
+
+	hdr_write_track = t;
+	hdr_write_start_playback = false;
+	hdr_write_od_merge = true;
+	mlr_flushing = true;
+	__dmb();
+	hdr_write_pending = true;
+
+	rec_track_idx = -1;
+	if (mlr_rec_track == t) mlr_rec_track = -1;
+	mlr_od_state = MLR_OD_IDLE;
+	mlr_od_track = -1;
+}
+
+/* Track cleared mid-session: nothing to keep. Core 1 drops the queued pages
+ * (mlr_flushing holds new recordings off until it has). */
+static void __not_in_flash_func(od_discard_session)(void)
+{
+	if (mlr_od_state >= MLR_OD_ACTIVE) {
+		od_live = false;
+		mlr_flushing = true;
+		__dmb();
+		od_discard = true;
+		rec_track_idx = -1;
+	}
+	mlr_rec_track = -1;
+	mlr_od_state = MLR_OD_IDLE;
+	mlr_od_track = -1;
+}
+
+/* A change that would move or bend the overdub track's playback. True =
+ * ignore it (Wait/Active: only an explicit record stop ends the take).
+ * During Finish it commits the session first and then lets it through. */
+static inline bool __not_in_flash_func(od_hold)(int track)
+{
+	if (track != mlr_od_track) return false;
+	if (mlr_od_state != MLR_OD_FINISH) return true;
+	od_commit(true);
+	return false;
+}
+
+/* The mixer consumed stored sample `old` of the overdub track: encode its
+ * new value, then advance the playhead (wrap = end of pass). */
+static void __attribute__((noinline)) __not_in_flash_func(od_step)(int t, mlr_track_t *tr, int16_t old)
+{
+	int32_t v = old;
+	if (mlr_od_state == MLR_OD_ACTIVE) {
+		v = ((v * (int32_t)mlr_dub_q8) >> 8) + ((int32_t)mlr_od_input << 4);
+		if (v >  (2047 << 4)) v =  (2047 << 4);
+		if (v < -(2048 << 4)) v = -(2048 << 4);
+	}
+	if (!rec_push16((int16_t)v)) {
+		PERF_COUNT(overdub_overflows);
+		od_commit(true);  /* core 1 can't keep up: keep what is written */
+	}
+
+	if (++tr->playhead < tr->length_samples) return;
+	tr->playhead = 0;
+	note_track_wrap(t);
+	if (mlr_od_state < MLR_OD_ACTIVE) return;  /* committed above */
+
+	/* end of pass */
+	if (rec_flush_partial() != tr->length_samples) {
+		PERF_COUNT(overdub_overflows);
+		od_commit(true);  /* the last nybble didn't fit: end here, short by one */
+		return;
+	}
+	PERF_COUNT(overdub_passes);
+	if (mlr_od_state == MLR_OD_FINISH) {
+		od_commit(false);
+		return;
+	}
+	od_passes++;
+	od_kf_full = rec_num_keyframes;
+	od_pass_reset(t);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1692,6 +2013,7 @@ static inline bool mix_track_steady_integer_dual(int t, mlr_track_t *tr,
 static int32_t __not_in_flash_func(mlr_play_mix_dual_sum)(int32_t *out_right)
 {
 	int32_t mixL = 0, mixR = 0;
+	int od_t = mlr_od_track;
 
 	for (int t = 0; t < MLR_NUM_TRACKS; t++) {
 		mlr_track_t *tr = &mlr_tracks[t];
@@ -1708,6 +2030,21 @@ static int32_t __not_in_flash_func(mlr_play_mix_dual_sum)(int32_t *out_right)
 		uint32_t wrap_end   = tr->loop_active ? tr->loop_end_sample   : tr->length_samples;
 		uint32_t wrap_start = tr->loop_active ? tr->loop_start_sample : 0;
 
+		/* Overdub track: no wrap crossfade (it jumps the read index past the
+		 * first samples of the next cycle, which the pass must encode), and
+		 * while a pass runs, the one-sample-per-output-sample path below. */
+		bool od_now = false;
+		if (t == od_t) {
+			if (transition_flags & MLR_TRANS_WRAP) {
+				tr->wrap_preview_ready = false;
+				transition_update_track_state(tr);
+				transition_flags = tr->transition_flags;
+			}
+			if (mlr_od_state == MLR_OD_WAIT)
+				od_try_begin(t, tr, transition_flags);
+			od_now = mlr_od_state >= MLR_OD_ACTIVE;
+		}
+
 		/* Cheap pre-gate: skip the heavy maybe_start_wrap_preview_xfade()
 		 * call until the playhead is within the arm window of the wrap
 		 * boundary. The arm position is computed on core 1 when the
@@ -1722,8 +2059,8 @@ static int32_t __not_in_flash_func(mlr_play_mix_dual_sum)(int32_t *out_right)
 			}
 		}
 
-		if (mix_track_steady_integer_dual(t, tr, transition_flags,
-		                                  wrap_start, wrap_end, &mixL, &mixR)) {
+		if (!od_now && mix_track_steady_integer_dual(t, tr, transition_flags,
+		                                             wrap_start, wrap_end, &mixL, &mixR)) {
 			continue;
 		}
 
@@ -1736,10 +2073,31 @@ static int32_t __not_in_flash_func(mlr_play_mix_dual_sum)(int32_t *out_right)
 		uint32_t ring_pos = 0;
 		bool ring_state_loaded = false;
 
+		if (od_now) {
+			/* Overdub pass: one stored sample per output sample. The raw ring
+			 * sample (before volume, filter and fades, which stay output-only
+			 * below) is what gets re-encoded. */
+			avail = tr->pcm.w - pcm_r;
+			if (avail > 0) {
+				PERF_NOTE_PCM_AVAIL(t, avail);
+				int16_t old = tr->pcm.buf[(pcm_r & MLR_RING_MASK) * MLR_NUM_CHANNELS];
+				tr->pcm.r = pcm_r + 1u;
+				tr->interp_prev[0] = tr->last_pcm[0];
+				tr->last_pcm[0] = old;
+				sample_out = old;
+				fast_integer = true;
+				od_step(t, tr, old);
+			} else {
+				/* starved: keep what is written, play on normally */
+				PERF_COUNT(overdub_starves);
+				od_commit(true);
+			}
+		}
+
 		/* Integer fast-step retry: only meaningful when speed_frac is one
 		 * of the integer ratios and the accumulator is aligned; otherwise
 		 * fall straight through to the variable-speed accumulator path. */
-		if (tr->speed_accum == 0) {
+		if (!fast_integer && tr->speed_accum == 0) {
 			uint32_t steps = integer_speed_steps(tr->speed_frac);
 			if (steps > 0) {
 				bool no_wrap = tr->reverse
@@ -1932,6 +2290,7 @@ int16_t __not_in_flash_func(mlr_play_mix_dual)(int16_t *out_right)
 void __not_in_flash_func(mlr_cut)(int track, int column)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return;
+	if (od_hold(track)) return;  /* overdub pass: ignored, or commits during the finish */
 	mlr_track_t *tr = &mlr_tracks[track];
 	if (!tr->has_content) return;
 
@@ -1957,6 +2316,7 @@ void __not_in_flash_func(mlr_cut)(int track, int column)
 void __not_in_flash_func(mlr_cut_sample)(int track, uint32_t sample_pos)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return;
+	if (od_hold(track)) return;  /* overdub pass: ignored, or commits during the finish */
 	mlr_track_t *tr = &mlr_tracks[track];
 	if (!tr->has_content) return;
 
@@ -1970,6 +2330,7 @@ void __not_in_flash_func(mlr_cut_sample)(int track, uint32_t sample_pos)
 void __not_in_flash_func(mlr_stop_track)(int track)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return;
+	if (od_hold(track)) return;  /* overdub pass: ignored, or commits during the finish */
 	mlr_track_t *tr = &mlr_tracks[track];
 	if (!tr->playing || tr->stop_pending) return;
 	tr->fade_out_active = true;
@@ -2008,6 +2369,7 @@ static void MLR_COLD_FUNC restore_loop_stopped(int track, int col_start, int col
 void __not_in_flash_func(mlr_set_loop)(int track, int col_start, int col_end)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return;
+	if (od_hold(track)) return;  /* overdub pass: ignored, or commits during the finish */
 	mlr_track_t *tr = &mlr_tracks[track];
 	if (!tr->has_content || tr->length_samples == 0) return;
 
@@ -2039,6 +2401,7 @@ void __not_in_flash_func(mlr_set_loop)(int track, int col_start, int col_end)
 void __not_in_flash_func(mlr_clear_loop)(int track)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return;
+	if (od_hold(track)) return;  /* overdub pass: ignored, or commits during the finish */
 	mlr_track_t *tr = &mlr_tracks[track];
 	if (!tr->loop_active) return;
 
@@ -2056,6 +2419,7 @@ void __not_in_flash_func(mlr_clear_loop)(int track)
 void __not_in_flash_func(mlr_set_speed)(int track, int speed_shift)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return;
+	if (od_hold(track)) return;  /* overdub pass: ignored, or commits during the finish */
 	if (speed_shift < -3) speed_shift = -3;
 	if (speed_shift >  3) speed_shift =  3;
 	mlr_track_t *tr = &mlr_tracks[track];
@@ -2072,6 +2436,7 @@ void __not_in_flash_func(mlr_set_speed)(int track, int speed_shift)
 void __not_in_flash_func(mlr_set_speed_frac)(int track, uint16_t speed_frac)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return;
+	if (od_hold(track)) return;  /* overdub pass: ignored, or commits during the finish */
 	if (speed_frac < 64) speed_frac = 64;
 	if (speed_frac > 1024) speed_frac = 1024;
 
@@ -2088,6 +2453,7 @@ void __not_in_flash_func(mlr_set_speed_frac)(int track, uint16_t speed_frac)
 void __not_in_flash_func(mlr_set_speed_frac_nondeclick)(int track, uint16_t speed_frac)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return;
+	if (od_hold(track)) return;  /* overdub pass: ignored, or commits during the finish */
 	if (speed_frac < 64) speed_frac = 64;
 	if (speed_frac > 1024) speed_frac = 1024;
 
@@ -2102,6 +2468,7 @@ void __not_in_flash_func(mlr_set_speed_frac_nondeclick)(int track, uint16_t spee
 void __not_in_flash_func(mlr_set_reverse)(int track, bool reverse)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return;
+	if (od_hold(track)) return;  /* overdub pass: ignored, or commits during the finish */
 	mlr_track_t *tr = &mlr_tracks[track];
 	if (tr->reverse == reverse) return;  /* no change */
 	PERF_NOTE_REVERSE_TOGGLE(track);
@@ -2152,6 +2519,7 @@ void __not_in_flash_func(mlr_get_loop_cols)(int track, int *col_start, int *col_
 void __not_in_flash_func(mlr_clear_track)(int track)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return;
+	if (track == mlr_od_track) od_discard_session();  /* nothing of it to keep */
 	mlr_track_t *tr = &mlr_tracks[track];
 	tr->playing        = false;
 	tr->has_content    = false;
@@ -2966,6 +3334,8 @@ void mlr_recall_clear(int slot)
  *   [...]  mon_version (uint8_t) + mlr_monitor_mode (uint8_t)          (2 bytes)
  *          (v2: MLR_MON_* mode; v1: 0 = off, 1 = on, read as Armed)
  *   [...]  flow_version (uint8_t) + mlr_rec_flow (uint8_t)             (2 bytes)
+ *   [...]  od_version (uint8_t) + mlr_rec_overdub (uint8_t)
+ *          + mlr_dub_q8 (uint16_t LE, 0..256)                          (4 bytes)
  *   [end]  uint32_t CRC32 (over everything from offset 0 to here)
  *
  * Loaders gate every trailing versioned block (groups onwards) on
@@ -3004,6 +3374,7 @@ enum {
 	MLR_SCENE_CVT_BYTES = 3,
 	MLR_SCENE_MON_BYTES = 2,
 	MLR_SCENE_FLOW_BYTES = 2,
+	MLR_SCENE_OD_BYTES = 4,
 	MLR_SCENE_CRC_BYTES = 4,
 	MLR_SCENE_MAX_SERIALIZED_BYTES =
 		MLR_SCENE_HEADER_BYTES +
@@ -3021,6 +3392,7 @@ enum {
 		MLR_SCENE_CVT_BYTES +
 		MLR_SCENE_MON_BYTES +
 		MLR_SCENE_FLOW_BYTES +
+		MLR_SCENE_OD_BYTES +
 		MLR_SCENE_CRC_BYTES,
 	MLR_SCENE_STAGING_BYTES =
 		((MLR_SCENE_MAX_SERIALIZED_BYTES + MLR_PAGE_SIZE - 1) / MLR_PAGE_SIZE) * MLR_PAGE_SIZE
@@ -3156,6 +3528,12 @@ static uint32_t scene_serialize(void)
 	/* record flow (appended at v1; follows mon) */
 	scene_blob[pos++] = 1;  /* flow version */
 	scene_blob[pos++] = mlr_rec_flow;
+
+	/* record mode + dub level (appended at v1; follows flow) */
+	scene_blob[pos++] = 1;  /* od version */
+	scene_blob[pos++] = mlr_rec_overdub;
+	scene_blob[pos++] = (uint8_t)(mlr_dub_q8 & 0xFFu);
+	scene_blob[pos++] = (uint8_t)(mlr_dub_q8 >> 8);
 
 	/* write data_len */
 	uint32_t data_len = pos - 8;
@@ -3363,6 +3741,18 @@ void MLR_COLD_FUNC mlr_scene_load(void)
 										(void)flow_version;
 										mlr_rec_flow = (flash[pos++] == MLR_REC_FLOW_DIRECT)
 											? MLR_REC_FLOW_DIRECT : MLR_REC_FLOW_SWITCH;
+
+										/* record mode + dub level (follow flow); older scenes:
+										 * Replace, 90 % */
+										if (pos + 4 <= end) {
+											uint8_t od_version = flash[pos++];
+											(void)od_version;
+											mlr_rec_overdub = (flash[pos++] == MLR_REC_OVERDUB)
+												? MLR_REC_OVERDUB : MLR_REC_REPLACE;
+											uint16_t dub = (uint16_t)(flash[pos] | (flash[pos + 1] << 8));
+											pos += 2;
+											mlr_dub_q8 = (dub <= 256u) ? dub : MLR_DUB_DEFAULT_Q8;
+										}
 									}
 								}
 							}
@@ -3450,6 +3840,8 @@ static inline void fill_region(const mlr_track_t *tr, uint32_t *ws, uint32_t *we
  * The CV rotation right now, in samples (always < the track length). */
 static inline uint32_t fill_latch_rot(const mlr_track_t *tr)
 {
+	int od = mlr_od_track;
+	if (od >= 0 && tr == &mlr_tracks[od]) return 0;  /* an overdub pass is never rotated */
 	return (uint32_t)(((uint64_t)tr->length_samples * tr->splice_q16) >> 16);
 }
 
@@ -4042,6 +4434,7 @@ static void prepare_wrap_preview(int t)
 {
 	mlr_track_t *tr = &mlr_tracks[t];
 	if (!tr->has_content || !tr->playing || tr->stop_pending) return;
+	if (t == mlr_od_track) return;  /* overdub: no wrap crossfade */
 	if (tr->fill_seek_pending || tr->seek_handoff_pending || tr->seek_xfade_active) return;
 	uint32_t steps = integer_speed_steps(tr->speed_frac);
 
@@ -4259,9 +4652,115 @@ static bool erase_hold_off(bool urgent)
 	return false;
 }
 
+/* ---- Overdub flash path (core 1) ------------------------------------
+ * The pass rewrites the track's own audio, which the refill is still
+ * reading ahead of playback. A sector is erased only once every one of its
+ * new pages is queued: playback has then consumed all of the sector's old
+ * audio, so the refill read it (read-before-erase), and until then the
+ * sector still holds the old audio an early commit needs. That keeps up to
+ * one sector (16 pages) plus the erase latency in the 32-page ring. */
+#define OD_URGENT_PAGES  28u  /* past this, erase even if a playback ring is low */
+
+/* Early commit: complete the open sector (k of its pages queued) with the
+ * old audio from flash, merging the byte the commit point splits. Only the
+ * pages of this sector are in the ring, and core 0 has stopped writing it. */
+static void MLR_COLD_FUNC od_junction_fill(int t, uint32_t need)  /* rare, core 1 only */
+{
+	uint32_t rel = rec_flash_offset - track_audio_flash_off(t);  /* sector start, bytes */
+	uint32_t used = page_ring_used_pages();
+	uint32_t x = od_junction_sample;
+	uint32_t jb = x >> 1;
+	if (jb < rel) jb = rel;                                   /* defensive */
+	if (jb > rel + used * MLR_PAGE_SIZE) jb = rel + used * MLR_PAGE_SIZE;
+	const uint8_t *old = track_audio_xip(t);
+	uint32_t end = rel + need * MLR_PAGE_SIZE;
+	for (uint32_t b = jb; b < end; b++) {
+		uint32_t i = b - rel;
+		uint8_t *p = &mlr_page_ring.pages[(uint8_t)(mlr_page_ring.r + i / MLR_PAGE_SIZE) % MLR_PAGE_RING_COUNT]
+		                                 [i % MLR_PAGE_SIZE];
+		uint8_t v = old[b];
+		if (b == (x >> 1) && (x & 1u))
+			v = (uint8_t)((*p & 0x0Fu) | (v & 0xF0u));  /* new low nybble, old high */
+		*p = v;
+	}
+	__dmb();
+	mlr_page_ring.w = (uint8_t)(mlr_page_ring.r + need);
+	od_junction_pending = false;
+}
+
+static void flush_od_page(void)
+{
+	int t = od_flush_track;
+	if (od_discard) {
+		/* track cleared mid-session: its pages are no longer wanted */
+		mlr_page_ring.r = mlr_page_ring.w;
+		od_discard = false;
+		od_junction_pending = false;
+		__dmb();
+		od_flush_track = -1;
+		return;
+	}
+	if (mlr_page_ring.r == mlr_page_ring.w) return;
+
+	uint32_t audio = track_audio_flash_off(t);
+	uint32_t pass_end = audio + od_pass_bytes;
+	uint32_t used = page_ring_used_pages();
+#ifdef MLR_PERF_PROFILING
+	perf_update_max(&mlr_perf_overdub_ring_max, used);
+#endif
+
+	if (!od_sector_ready) {
+		uint32_t need = (pass_end - rec_flash_offset) / MLR_PAGE_SIZE;
+		if (need > MLR_SECTOR_SIZE / MLR_PAGE_SIZE) need = MLR_SECTOR_SIZE / MLR_PAGE_SIZE;
+		bool junction = false;
+		if (used < need) {
+			if (!od_junction_pending) return;  /* sector not complete yet */
+			od_junction_fill(t, need);
+			junction = true;
+		}
+		/* Read-before-erase, checked even though the rule above implies it:
+		 * while the pass runs, never erase a sector the refill is still
+		 * reading (it can't come round to it again within one pass: the
+		 * track is >= 2 s, the ring holds < 1 s). No cap: unread audio
+		 * would be lost. After the commit the old audio is in the pages. */
+		if (od_live && !junction) {
+			uint32_t f = mlr_tracks[t].fill_byte_pos + audio;
+			if (f >= rec_flash_offset && f < rec_flash_offset + MLR_SECTOR_SIZE) {
+				PERF_COUNT(overdub_erase_holds);
+				return;
+			}
+		}
+		if (erase_hold_off(page_ring_used_pages() >= OD_URGENT_PAGES))
+			return;
+		PERF_FLASH_ERASE(rec_flash_offset, MLR_SECTOR_SIZE);
+		od_sector_ready = true;
+	}
+
+	uint8_t slot = mlr_page_ring.r % MLR_PAGE_RING_COUNT;
+	PERF_FLASH_PROGRAM(rec_flash_offset, mlr_page_ring.pages[slot], MLR_PAGE_SIZE);
+	rec_flash_offset += MLR_PAGE_SIZE;
+	if (rec_flash_offset >= pass_end) {
+		rec_flash_offset = audio;  /* next pass */
+		od_sector_ready = false;
+	} else if ((rec_flash_offset & (MLR_SECTOR_SIZE - 1u)) == 0) {
+		od_sector_ready = false;
+	}
+
+	__dmb();
+	mlr_page_ring.r++;
+#ifdef MLR_PERF_PROFILING
+	mlr_perf.rec_page_flush_count++;
+	mlr_perf_rec_page_flush_count++;
+#endif
+}
+
 /** Drain one page from the recording page ring to flash. */
 static void flush_rec_page(void)
 {
+	if (od_flush_track >= 0) {
+		flush_od_page();
+		return;
+	}
 	if (mlr_page_ring.r == mlr_page_ring.w) return;  /* nothing to flush */
 
 	uint8_t slot = mlr_page_ring.r % MLR_PAGE_RING_COUNT;
@@ -4302,6 +4801,14 @@ static void write_track_header(int t, bool start_playback)
 		       tr->num_keyframes * sizeof(mlr_keyframe_channels_t));
 	} else {
 		memcpy(hdr_staging, (const void *)(XIP_BASE + track_hdr_flash_off(t)), MLR_SECTOR_SIZE);
+		if (hdr_write_od_merge) {
+			/* Overdub: the session's keyframes up to where it got, the old
+			 * ones after (the count and length don't change). */
+			uint32_t n = od_kf_merge;
+			if (n > MLR_MAX_KEYFRAMES) n = MLR_MAX_KEYFRAMES;
+			memcpy(((mlr_track_header_t *)hdr_staging)->keyframes, rec_keyframes,
+			       n * sizeof(mlr_keyframe_channels_t));
+		}
 	}
 
 	mlr_track_header_t *hdr = (mlr_track_header_t *)hdr_staging;
@@ -4334,6 +4841,7 @@ static void write_track_header(int t, bool start_playback)
 				tr->fill_decode[ch].step_index = rec_keyframes[0].ch[ch].step_index;
 			}
 		}
+		track_kf0[t] = tr->fill_decode[0];
 		tr->pcm.w = 0;
 		tr->pcm.r = 0;
 		fill_rot_reset(tr);
@@ -4440,6 +4948,7 @@ static void copy_finish_track(void)
 			dst->fill_decode[ch].step_index = track_keyframes(copy_src_track)[0].ch[ch].step_index;
 		}
 	}
+	track_kf0[copy_dst_track] = dst->fill_decode[0];
 }
 
 static void copy_track_task(void)
@@ -4500,14 +5009,16 @@ void mlr_io_task(void)
 
 	/* 1. Handle pending seeks (always scan all — seeks are rare + cheap) */
 	for (int t = 0; t < MLR_NUM_TRACKS; t++) {
-		if (mlr_tracks[t].fill_seek_pending) {
+		/* A cut that ended an overdub waits for its header: until then the
+		 * keyframes in flash don't describe the new audio. */
+		if (mlr_tracks[t].fill_seek_pending && t != od_flush_track) {
 			handle_seek(t);
 		}
 	}
 
 	/* 2. Drain recording pages first so record writes are not starved by
 	 *    playback refill work when many tracks are running. */
-	if (rec_track_idx >= 0 || mlr_page_ring.r != mlr_page_ring.w) {
+	if (rec_track_idx >= 0 || mlr_page_ring.r != mlr_page_ring.w || od_flush_track >= 0) {
 		flush_rec_page();
 
 		/* If backlog is growing, drain a few extra pages this tick. */
@@ -4591,6 +5102,13 @@ void mlr_io_task(void)
 		write_track_header(hdr_write_track, hdr_write_start_playback);
 		hdr_write_pending = false;
 		hdr_write_start_playback = false;
+		if (hdr_write_od_merge) {
+			/* overdub committed: hand the recorder back to core 0 */
+			hdr_write_od_merge = false;
+			od_junction_pending = false;
+			__dmb();
+			od_flush_track = -1;
+		}
 		mlr_flushing = false;
 	}
 
@@ -4601,7 +5119,7 @@ void mlr_io_task(void)
 
 	/* 7. No header write pending: flushing ends once page ring is drained */
 	if (!hdr_write_pending && !copy_pending && copy_dst_track < 0 &&
-	    mlr_flushing && rec_track_idx < 0 &&
+	    mlr_flushing && rec_track_idx < 0 && od_flush_track < 0 &&
 	    mlr_page_ring.r == mlr_page_ring.w &&
 	    hdr_rewrite_pending_mask == 0) {
 		mlr_flushing = false;

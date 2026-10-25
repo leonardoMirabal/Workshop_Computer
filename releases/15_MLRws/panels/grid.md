@@ -65,6 +65,10 @@ The two grid keys at the top left of the grid control which page is selected bet
 
 The third key in the top row (col 2, on 16-wide and 8x8 grids) chooses how recording works. **Dim = Switch flow**: arm a track, then move the switch to record (as in earlier versions). **Lit = Direct flow**: a tap on a track's arm key records, as on mlr/mlre for norns. See [Recording](#recording). The setting works on both pages, is saved with your other settings, and patterns and recalls never change it.
 
+### Record mode
+
+The fourth key in the top row (col 3, **16-wide grids only**) chooses what a recording does to a track that already has audio. **Dim = Replace**: the new recording replaces it (as in earlier versions). **Lit = Overdub**: the input is layered onto the track while it plays. See [Overdub](#overdub). One press toggles it, on either page. It's saved with your other settings, and patterns, recalls and the 5-second DELETE reset never change it. On 8x8 grids col 3 is Pattern 1, so there's no key for it and recording always replaces.
+
 ### Pattern looper
 
 Patterns are **timed motion recorders**. They capture every grid-based event you
@@ -188,6 +192,8 @@ Five discrete level slots. From left to right they are about +3 dB, unity (the d
 While a track is **actively recording**, the mixer area turns into a record-progress
 bar instead of a mixer, indicating how much recording time remains at the current recording speed.
 
+In [Overdub](#overdub) mode (16-wide), on a track with audio that is armed or overdubbing, the five keys set the **dub level** instead, and the selected one is lit. The track's mixer level doesn't change. When nothing on the row is armed or overdubbing, they are the mixer again. Holding the row's reverse key still shows and sets the [filter](#filter) there.
+
 ![REC mixer](https://raw.githubusercontent.com/TomWhitwell/Workshop_Computer/main/releases/15_MLRws/docs/images/rec_mixer.jpg)
 
 
@@ -289,3 +295,19 @@ With the record flow key lit and the switch at **Middle**, the arm keys on the R
 - While a direct recording runs, the switch doesn't stop it. Tapping an arm key on another row stops it too.
 - With a track armed or listening, moving the switch Up or Down starts it as an armed recording, and Pulse In 2 records it for as long as the gate is high. Quick recording works as usual. The [hop](#pan) is off in Direct flow, so a tap always records.
 - When the maximum length is reached the recording stops, as usual. After any recording the card writes it to flash and then waits about 0.5 s before the next one can start. A tap on a track with audio during that wait records it as soon as the wait ends.
+
+#### Overdub
+
+With the [record mode](#record-mode) key lit (16-wide grids), any recording on a track that already has audio becomes an overdub: the track keeps playing and the input is layered onto it. Empty tracks record normally, including the Direct-flow level trigger.
+
+- **Start**: arm and move the switch (Switch flow), tap the arm key (Direct flow), use quick recording, or Pulse In 2. Arming doesn't stop the track. If the track is playing, the overdub starts at its next loop point (sample 0); the arm key flickers fast while it waits. If it's stopped, it starts playing from the beginning and the overdub starts at once. The arm key then blinks as for a recording.
+- **Passes**: each pass goes once through the whole track. While you keep recording, passes follow one another, each on top of the previous one.
+- **Stop**: as for a recording (the switch back to Middle, a tap in Direct flow, Pulse In 2 low, releasing a quick-record key, or disarming). The input is muted at once, and the rest of the pass is rewritten unchanged up to the loop point. Meanwhile the arm key swells slowly. At the loop point the card writes the track to flash. Playback carries on throughout.
+- **Dub level**: how much of the old audio each pass keeps, 0 %, 50 %, 75 %, 90 % (the default) or 100 %. Set it with the [mixer keys](#mixer) of an armed or overdubbing row; it applies at once, also during a pass. One level for all tracks, saved with your other settings. At 100 % the old audio stays at full level; at 0 % each pass replaces what it passes over.
+- **What the overdub needs**: speed 1× (col 11), forward, no loop, no CV rotation, not gated playback, and at least 2 s of audio. Otherwise the start is refused: the arm key flickers four times, the track is disarmed, and nothing changes. While you record, changes that would break that are ignored on the track: cuts, stops, loops, speed and reverse, from the grid, patterns, recalls and group actions (group cuts skip it). Pan, level and filter still work.
+- **Stopping early**: during the silent finish, a cut, a stop, or a pattern or recall that moves the track ends the overdub at once, and then the cut or stop happens. The track keeps the new audio up to that point and the previous audio after it. Continuous playback across that point can have a short glitch (a small level or DC step) until the end of that loop; cuts after it are clean. Let the finish reach the loop point for a seamless result.
+- **Monitoring and input**: the overdub records the live input (no pre-roll, so it lines up with what you hear), at the Knob X level, from the track's input (In 1, In 2 or A+B). The [monitor](#input-monitor) works as for any recording.
+- **Sound**: each pass decodes and re-encodes the whole track, which adds a little noise (about −35 to −40 dB per pass). With a dub level below 100 % older layers fade, so the noise stays bounded; at 100 % it builds up slowly over many passes.
+- **Flash wear**: every pass rewrites the whole track in flash (one erase per 4 KB per pass). A 4 s loop overdubbed nonstop reaches the flash's rated 100,000 erases in about 110 hours; shorter loops wear faster. That's fine for overdubbing by hand, but don't leave it recording for days.
+- **Power loss**: the track's seek table is written once, at the end. If power is lost during an overdub, the audio is there, but cuts into it may sound wrong until the track is recorded or overdubbed again (playing it from the start is fine).
+- **Gridless** mode and 8x8 grids always replace.

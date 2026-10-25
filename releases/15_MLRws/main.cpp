@@ -10,10 +10,11 @@
  *   CUT (col 1): playhead cutting, loop-a-section
  *
  * Row 0 layout (16-wide grid; 8x8 collapses Cols 4–7 → 3–6 and
- * Col 14 → Col 7, and omits the recall block):
+ * Col 14 → Col 7, and omits the recall block and the record-mode key):
  *   Col 0     = REC page (DELETE + REC: monitor Always / Armed / Off)
  *   Col 1     = CUT page
  *   Col 2     = record flow (lit = Direct, dim = Switch; both grid sizes)
+ *   Col 3     = record mode (lit = Overdub, dim = Replace; 16-wide only)
  *   Cols 4–7  = Pattern 1–4 (timed motion recorders)
  *   Cols 9–12 = Recall 1–4 (instant snapshot slots, 16-wide only)
  *   Col 14    = ALT modifier
@@ -27,6 +28,11 @@
  *   audio to record it (starts on release), tap again to stop; an empty
  *   track arms and starts when its input passes -18 dBFS. Every start
  *   keeps a 10 ms pre-roll.
+ *   Overdub mode (16-wide): a take on a track with audio layers the live
+ *   input onto it while it plays, in whole-track passes from sample 0
+ *   (1x forward, no loop/rotation, >= 2 s); the old audio is kept at the
+ *   dub level, which the REC mixer keys of the armed row set. A stop
+ *   finishes the pass silently, then the track is written once.
  *
  * Knob Main      = master output volume
  * Audio In 1/2   = record source (per-track recorded_channel selects
@@ -113,6 +119,7 @@ enum {
 	PERF_CMD_LPF       = 11, /* track, arg = low-pass slot 0..4 */
 	PERF_CMD_CV        = 12, /* track = CV input (0 = In 1, 1 = In 2); arg 0 = real jack,
 	                          * 1..254 = held value (arg - 128) * 16, 255 = fast sweep */
+	PERF_CMD_OVERDUB   = 13, /* track 0; arg bit 0 = Overdub mode, bits 1..3 = dub slot 0..4 */
 };
 static int perf_splice_override = -1;  /* Q16 splice standing in for CV In 2, -1 = use CV */
 /* Fake CV In 1/2 for the stress test, through the real CV paths: PERF_CV_REAL =
@@ -129,6 +136,9 @@ volatile uint32_t mlr_perf_cmd_ack = 0;
 /* DELETE + REC key monitor mode cycle: same window, 3 quick flashes = Always,
  * 2 quick = Armed, 1 long = Off */
 #define MONITOR_FLASH_SAMPLES      DELETE_RESET_FLASH_SAMPLES
+/* Overdub refused (speed, reverse, loop, ...): the arm key flickers. */
+#define REFUSE_FLASH_PERIOD_SAMPLES (MLR_SAMPLE_RATE_HZ / 20u)  /* 50 ms half-period */
+#define REFUSE_FLASH_SAMPLES       (REFUSE_FLASH_PERIOD_SAMPLES * 8u)  /* four fast flickers */
 #define EXTRA_GUIDE_ENABLED 0x80u
 #define EXTRA_PATTERN_KEY_MASK 0x7Fu
 #define EXTRA_PATTERN_KEY_NONE 0x70u
@@ -629,12 +639,19 @@ public:
 			rec_gated = false;
 		}
 
-		/* Start recording if armed track exists and switch moves to rec position */
+		/* Start recording if armed track exists and switch moves to rec position
+		 * (busy while an overdub finishes its pass: tried again next sample) */
 		if (rec_armed_track >= 0 && rec_modifier && mlr_rec_track < 0 && !rec_limit_latched && rec_start_lockout_samples_ == 0) {
-			if (resume_after_arm_track_ == rec_armed_track)
-				resume_after_arm_track_ = -1;
-			mlr_start_record(rec_armed_track);
-			rec_speed_accum = 0;
+			int t = rec_armed_track;
+			RecStart r = begin_record(t);
+			if (r == REC_STARTED) {
+				if (resume_after_arm_track_ == t)
+					resume_after_arm_track_ = -1;
+				rec_speed_accum = 0;
+			} else if (r == REC_REFUSED) {
+				rec_armed_track = -1;  /* overdub refused: the track carries on as is */
+				direct_start_pending_ = false;
+			}
 		}
 		/* Stop recording if switch returns to middle or armed track changes.
 		 * Pulse-gated and Direct-flow takes have their own stop. */
@@ -643,14 +660,17 @@ public:
 			mlr_stop_record();
 			rec_speed_accum = 0;
 			if (rec_armed_track >= 0 && rec_modifier && rec_armed_track != mlr_rec_track && !mlr_flushing && !rec_limit_latched && rec_start_lockout_samples_ == 0) {
-				mlr_start_record(rec_armed_track);
+				RecStart r = begin_record(rec_armed_track);
+				if (r == REC_REFUSED) rec_armed_track = -1;
 				rec_speed_accum = 0;
 			}
 		}
 
-		/* ---- stop armed track so recording starts from silence ---- */
+		/* ---- stop armed track so recording starts from silence ----
+		 * (not in Overdub mode: an overdub plays the track through the take) */
 		if (run_ui_control && rec_armed_track >= 0 && !rec_gated &&
-		    mlr_tracks[rec_armed_track].playing) {
+		    mlr_tracks[rec_armed_track].playing &&
+		    !overdub_applies(rec_armed_track) && rec_armed_track != mlr_od_track) {
 			resume_after_arm_track_ = rec_armed_track;
 			mlr_stop_track(rec_armed_track);
 		}
@@ -681,14 +701,18 @@ public:
 		}
 		if (PulseIn2RisingEdge()) {
 			if (rec_armed_track >= 0 && mlr_rec_track < 0 && !mlr_flushing &&
+			    mlr_od_state == MLR_OD_IDLE &&
 			    !rec_limit_latched && rec_start_lockout_samples_ == 0) {
-				if (mlr_tracks[rec_armed_track].playing) {
+				if (mlr_tracks[rec_armed_track].playing && !overdub_applies(rec_armed_track)) {
 					resume_after_arm_track_ = rec_armed_track;
 					mlr_stop_track(rec_armed_track);
 				}
-				mlr_start_record(rec_armed_track);
-				rec_speed_accum = 0;
-				rec_pulse_gated_ = true;
+				if (begin_record(rec_armed_track) == REC_STARTED) {
+					rec_speed_accum = 0;
+					rec_pulse_gated_ = true;
+				} else {
+					rec_armed_track = -1;  /* overdub refused */
+				}
 			}
 		}
 		if (PulseIn2FallingEdge()) {
@@ -714,6 +738,8 @@ public:
 			delete_reset_flash_samples_remaining_--;
 		if (monitor_flash_samples_remaining_ > 0)
 			monitor_flash_samples_remaining_--;
+		if (refuse_flash_samples_remaining_ > 0)
+			refuse_flash_samples_remaining_--;
 		PERF_UI_SECTION_END(1);
 
 		PERF_UI_SECTION_START(2);
@@ -756,7 +782,15 @@ public:
 				start_direct_record(rec_armed_track);
 		}
 
-		if (mlr_rec_track >= 0) {
+		if (mlr_rec_track >= 0 && mlr_rec_track == mlr_od_track) {
+			/* Overdub: the mixer encodes this input against the stored sample
+			 * it plays now, so it takes the live input (through the pre-roll it
+			 * would land 10 ms late). Knob X and the A/B/A+B pick as recording. */
+			int32_t scaled = ((int32_t)dry_in * (int32_t)dry_level) >> 8;
+			if (scaled > 2047) scaled = 2047;
+			if (scaled < -2048) scaled = -2048;
+			mlr_od_input = (int16_t)scaled;
+		} else if (mlr_rec_track >= 0) {
 			/* Recording captures the input scaled only by the input gain knob.
 			 * The mixer slot is a playback control and is applied during
 			 * playback (mlr_play_mix_dual_sum) and during monitoring
@@ -812,6 +846,15 @@ public:
 				mlr_rec_flow = (mlr_rec_flow == MLR_REC_FLOW_DIRECT)
 					? MLR_REC_FLOW_SWITCH : MLR_REC_FLOW_DIRECT;
 				direct_start_pending_ = false;
+				note_settings_changed();
+				page_switched = true;
+			}
+			else if (col == 3 && !small_grid_) {
+				/* Record mode: Replace <-> Overdub (16-wide; on 8x8 col 3 is
+				 * Pattern 1). Applies to the next take; one in progress carries
+				 * on. No mlr_* event, so patterns never record it. */
+				mlr_rec_overdub = (mlr_rec_overdub == MLR_REC_OVERDUB)
+					? MLR_REC_REPLACE : MLR_REC_OVERDUB;
 				note_settings_changed();
 				page_switched = true;
 			}
@@ -1320,6 +1363,8 @@ private:
 	uint32_t   delete_reset_flash_samples_remaining_ = 0;  /* confirmation flash countdown */
 	bool       delete_reset_fired_ = false;       /* require DELETE release before another reset */
 	uint32_t   monitor_flash_samples_remaining_ = 0;  /* REC key monitor on/off confirmation */
+	int        refuse_flash_track_ = -1;              /* overdub refused: flicker this arm key */
+	uint32_t   refuse_flash_samples_remaining_ = 0;
 	uint16_t   mon_fade_frac_ = 0;   /* monitor fade-in envelope, 0..256 */
 	uint16_t   mon_vol_last_  = 256; /* last-known armed/rec track volume_frac */
 	uint8_t    mon_ch_last_   = 0;   /* last-known armed/rec track recorded_channel */
@@ -2659,9 +2704,10 @@ private:
 		}
 
 		if (rec_pos && rec_armed_track < 0 && mlr_rec_track < 0 && !mlr_flushing && !rec_limit_latched && rec_start_lockout_samples_ == 0) {
-			mlr_start_record(track);
-			rec_speed_accum = 0;
-			rec_gated = true;
+			if (begin_record(track) == REC_STARTED) {
+				rec_speed_accum = 0;
+				rec_gated = true;
+			}
 		} else if (!rec_pos || rec_armed_track >= 0) {
 			if (rec_armed_track == track) {
 				set_armed_track(-1);
@@ -2677,18 +2723,60 @@ private:
 		}
 	}
 
+	/* Overdub mode (16-wide only; 8x8 has no key for it and always
+	 * replaces): a take on a track with audio layers onto it. */
+	bool overdub_applies(int track) const
+	{
+		return mlr_rec_overdub == MLR_REC_OVERDUB && !small_grid_ &&
+		       track >= 0 && mlr_tracks[track].has_content;
+	}
+
+	/* REC page, 16-wide: this row's cols 2-6 set the dub level (Overdub
+	 * mode, the row armed or overdubbing). */
+	bool dub_row(int track) const
+	{
+		return overdub_applies(track) && (rec_armed_track == track || mlr_od_track == track);
+	}
+
+	enum RecStart { REC_STARTED, REC_BUSY, REC_REFUSED };
+
+	/* Every record start: an overdub session in Overdub mode, else a fresh
+	 * recording. Busy = an overdub is still finishing its pass (try again
+	 * later); refused = the track can't take an overdub as it plays now
+	 * (speed, reverse, loop, rotation, gate, < 2 s): it carries on as is and
+	 * its arm key flickers. */
+	RecStart __attribute__((noinline)) __not_in_flash("begin_record") begin_record(int track)
+	{
+		if (mlr_od_state != MLR_OD_IDLE) return REC_BUSY;
+		if (overdub_applies(track)) {
+			if (mlr_flushing || mlr_copying) return REC_BUSY;
+			if (mlr_overdub_start(track)) return REC_STARTED;
+			refuse_flash_track_ = track;
+			refuse_flash_samples_remaining_ = REFUSE_FLASH_SAMPLES;
+			return REC_REFUSED;
+		}
+		mlr_start_record(track);
+		return REC_STARTED;
+	}
+
 	/* Direct flow: start a take on the armed track. Same path as a Pulse In 2
 	 * start; the switch never stops it (rec_auto_gated_), an arm key does. */
 	void __not_in_flash("start_direct_record") start_direct_record(int track)
 	{
+		if (mlr_od_state != MLR_OD_IDLE) return;  /* an overdub is finishing: retry */
 		if (resume_after_arm_track_ == track)
 			resume_after_arm_track_ = -1;
-		if (mlr_tracks[track].playing)
+		/* an overdub plays on through the take */
+		if (!overdub_applies(track) && mlr_tracks[track].playing)
 			mlr_stop_track(track);
-		mlr_start_record(track);
-		rec_speed_accum = 0;
-		rec_auto_gated_ = true;
+		RecStart r = begin_record(track);
 		direct_start_pending_ = false;
+		if (r == REC_STARTED) {
+			rec_speed_accum = 0;
+			rec_auto_gated_ = true;
+		} else {
+			rec_armed_track = -1;  /* refused: leave the track as it is */
+		}
 	}
 
 	void __not_in_flash("stop_direct_record") stop_direct_record()
@@ -3146,16 +3234,24 @@ private:
 				mlr_stop_track(t);
 				break;
 			case PERF_CMD_REC_START:
-				if (mlr_rec_track < 0 && !mlr_flushing && !rec_limit_latched && rec_start_lockout_samples_ == 0) {
+				if (mlr_rec_track < 0 && !mlr_flushing && mlr_od_state == MLR_OD_IDLE &&
+				    !rec_limit_latched && rec_start_lockout_samples_ == 0) {
 					rec_armed_track = t;
-					if (mlr_tracks[t].playing) {
+					if (mlr_tracks[t].playing && !overdub_applies(t)) {
 						resume_after_arm_track_ = t;
 						mlr_stop_track(t);
 					}
-					mlr_start_record(t);
-					rec_speed_accum = 0;
-					rec_pulse_gated_ = true;
+					if (begin_record(t) == REC_STARTED) {
+						rec_speed_accum = 0;
+						rec_pulse_gated_ = true;
+					} else {
+						rec_armed_track = -1;
+					}
 				}
+				break;
+			case PERF_CMD_OVERDUB:
+				mlr_rec_overdub = (arg & 1) ? MLR_REC_OVERDUB : MLR_REC_REPLACE;
+				mlr_dub_q8 = mlr_dub_slot_q8((arg >> 1) & 7);
 				break;
 			case PERF_CMD_REC_STOP:
 				if (rec_pulse_gated_ && mlr_rec_track >= 0) {
@@ -3654,6 +3750,12 @@ private:
 				if (!cv_owns)
 					group_set_lpf(track, column - 2);
 				lpf_edited_mask_ |= (uint8_t)(1u << track);
+			} else if (column >= 2 && column <= 6 && dub_row(track)) {
+				/* Overdub, row armed or overdubbing: the keys set the (global)
+				 * dub level 0 / 50 / 75 / 90 / 100 %, not the mixer. Not a
+				 * pattern event. Takes effect on the running pass. */
+				mlr_dub_q8 = mlr_dub_slot_q8(column - 2);
+				note_settings_changed();
 			} else if (column >= 2 && column <= 6) {
 				int slot = column - 2;
 				group_set_volume(track, slot);
@@ -3855,6 +3957,9 @@ private:
 
 		/* Record flow: lit = Direct, dim = Switch */
 		grid.frameLedUnchecked(2, 0, mlr_rec_flow == MLR_REC_FLOW_DIRECT ? 12 : 3);
+		/* Record mode (16-wide): lit = Overdub, dim = Replace */
+		if (!small_grid_)
+			grid.frameLedUnchecked(3, 0, mlr_rec_overdub == MLR_REC_OVERDUB ? 12 : 3);
 
 		/* REC key: monitor mode confirmation over the page brightness */
 		if (monitor_flash_samples_remaining_ > 0) {
@@ -3955,13 +4060,23 @@ private:
 
 			bool has = mlr_tracks[t].has_content;
 			bool armed = (rec_armed_track == t);
-			bool actively_rec = (recording && t == mlr_rec_track);
+			bool actively_rec = (recording && t == mlr_rec_track && t != mlr_od_track); /* overdub: keep the playhead */
 			bool listening = direct_flow && !has;  /* Direct flow: an armed empty track */
+			/* Overdub session on this row: Wait (pass starts at the next wrap),
+			 * Active (shown as recording), Finish (silent re-encode to the wrap). */
+			uint8_t od_state = (mlr_od_track == t) ? mlr_od_state : (uint8_t)MLR_OD_IDLE;
+			bool od_busy = od_state != MLR_OD_IDLE;
+			bool rec_like = actively_rec || od_busy;
 
 			/* col 0 (and col 1 on 16-wide): paired channel-select + arm/status indicator.
 			 * On 8x8 grids only col 0 is the arm indicator. */
 			uint8_t state_bright;
-			if (actively_rec) {
+			if (od_state == MLR_OD_WAIT) {
+				state_bright = (rec_blink & 1) ? 12 : 2;  /* fast flicker: waiting for the wrap */
+			} else if (od_state == MLR_OD_FINISH) {
+				int d = 8 - (int)rec_blink;
+				state_bright = (uint8_t)(12 - (d < 0 ? -d : d));  /* slow swell: finishing the pass */
+			} else if (actively_rec) {
 				state_bright = (rec_blink & 2) ? 15 : 4;
 			} else if (armed && listening) {
 				state_bright = (rec_blink & 0xA) ? 3 : 12;  /* double blink: waiting for the input */
@@ -3976,6 +4091,10 @@ private:
 				bool on = (copy_flash_samples_remaining_ / copy_flash_period_) & 1;
 				state_bright = on ? 15 : 0;
 			}
+			if (refuse_flash_track_ == t && refuse_flash_samples_remaining_ > 0) {
+				bool on = (refuse_flash_samples_remaining_ / REFUSE_FLASH_PERIOD_SAMPLES) & 1;
+				state_bright = on ? 15 : 0;  /* overdub refused */
+			}
 			if (small_grid_) {
 				/* 8x8: col 0 alone keeps today's record-arm semantics. */
 				grid.frameLedUnchecked(0, row, state_bright);
@@ -3983,7 +4102,7 @@ private:
 				uint8_t ch = mlr_tracks[t].recorded_channel;
 				bool user_chosen = mlr_tracks[t].channel_user_chosen;
 				uint8_t col0_bright, col1_bright;
-				if (!has && !armed && !actively_rec) {
+				if (!has && !armed && !rec_like) {
 					col0_bright = state_bright;
 					col1_bright = state_bright;
 				} else if (ch == MLR_CH_AB) {
@@ -3991,7 +4110,7 @@ private:
 					 * idle; no pan display, since pan is ignored). */
 					col0_bright = state_bright;
 					col1_bright = state_bright;
-				} else if (mlr_pan_enabled && !armed && !actively_rec) {
+				} else if (mlr_pan_enabled && !armed && !rec_like) {
 					/* Output pan across the two keys: hard left = key 1 only
 					 * (like dual-mono channel 1), centre = both at half. */
 					int e = mlr_pan_effective_q8(t) + MLR_PAN_STEPS * 256;  /* 0..3072, includes CV */
@@ -4061,8 +4180,13 @@ private:
 			} else {
 				/* 16x8 REC: cols 0-1=channel+arm indicator (drawn above),
 				 * cols 2-6=mixer (5 slots), col 7=reverse, cols 8-14=speed */
-				/* record progress: cols 2–6 (overlays mixer during recording) */
-				if (actively_rec) {
+				/* record progress: cols 2–6 (overlays mixer during recording);
+				 * in Overdub mode an armed/overdubbing row shows the dub level */
+				if (dub_row(t)) {
+					int sel = mlr_dub_q8_slot(mlr_dub_q8);
+					for (int c = 0; c < MLR_DUB_SLOTS; c++)
+						grid.frameLedUnchecked(c + 2, row, c == sel ? 14 : 3);
+				} else if (actively_rec) {
 					uint32_t progress = mlr_get_rec_progress() * 5 / MLR_MAX_SAMPLES;
 					if (progress > 5) progress = 5;
 					for (uint32_t c = 0; c < progress; c++)
@@ -4178,7 +4302,7 @@ private:
 		{
 			int row = t + 1;
 			bool has = mlr_tracks[t].has_content;
-			bool actively_rec = (recording && t == mlr_rec_track);
+			bool actively_rec = (recording && t == mlr_rec_track && t != mlr_od_track); /* overdub: keep the playhead */
 
 			/* recording track: progress bar on cut columns */
 			if (actively_rec) {
