@@ -412,6 +412,14 @@ extern volatile uint8_t mlr_cv2_mode;    /* what CV In 2 drives on its target tr
 #define MLR_CV_TARGET_ALL      ((1u << MLR_NUM_TRACKS) - 1u)
 extern volatile uint8_t mlr_cv1_target;  /* CV In 1: pan offset */
 extern volatile uint8_t mlr_cv2_target;  /* CV In 2: filter cutoff / rotation */
+/* Mix the dry input into the outputs while armed/recording/switch Up
+ * (scene; default on, or off with the MLR_MONITOR_DEFAULT_OFF build option). */
+#ifdef MLR_MONITOR_DEFAULT_OFF
+#define MLR_MONITOR_DEFAULT    false
+#else
+#define MLR_MONITOR_DEFAULT    true
+#endif
+extern volatile bool   mlr_monitor_enabled;
 extern volatile int    mlr_recall_active;  /* currently selected recall (-1=none) */
 
 /* Per-track group-membership bitmask (see mlr.c for invariant). */

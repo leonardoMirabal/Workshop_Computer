@@ -119,6 +119,8 @@ volatile uint32_t mlr_perf_cmd_ack = 0;
 #endif
 #define DELETE_RESET_FLASH_PERIOD_SAMPLES (MLR_SAMPLE_RATE_HZ / 10u) /* 100 ms half-period */
 #define DELETE_RESET_FLASH_SAMPLES (DELETE_RESET_FLASH_PERIOD_SAMPLES * 6u)  /* three quick flashes */
+/* DELETE + REC key monitor toggle: same window, 3 quick flashes = on, 1 long = off */
+#define MONITOR_FLASH_SAMPLES      DELETE_RESET_FLASH_SAMPLES
 #define EXTRA_GUIDE_ENABLED 0x80u
 #define EXTRA_PATTERN_KEY_MASK 0x7Fu
 #define EXTRA_PATTERN_KEY_NONE 0x70u
@@ -667,6 +669,8 @@ public:
 		}
 		if (delete_reset_flash_samples_remaining_ > 0)
 			delete_reset_flash_samples_remaining_--;
+		if (monitor_flash_samples_remaining_ > 0)
+			monitor_flash_samples_remaining_--;
 		PERF_UI_SECTION_END(1);
 
 		PERF_UI_SECTION_START(2);
@@ -719,7 +723,15 @@ public:
 			int col = grid.lastX();
 			bool alt_held = delete_action_held();
 			int pcs = pat_col_start();
-			if (col == 0) {
+			if (col == 0 && alt_held) {
+				/* DELETE + REC: toggle the input monitor. No page switch, and
+				 * no mlr_* event, so patterns never record it. */
+				mlr_monitor_enabled = !mlr_monitor_enabled;
+				monitor_flash_samples_remaining_ = MONITOR_FLASH_SAMPLES;
+				note_settings_changed();
+				page_switched = true;  /* consume the key, like page navigation */
+			}
+			else if (col == 0) {
 				bool leaving_cut = (play_page == PAGE_CUT);
 				play_page = PAGE_REC;
 				page_switched = true;
@@ -924,7 +936,7 @@ public:
 		int16_t mix = mlr_play_mix_dual(&mix_r);
 		int32_t outL = (int32_t)mix;
 		int32_t outR = (int32_t)mix_r;
-		if (dry_level > 0 && (rec_armed_track >= 0 || sw == Switch::Up)) {
+		if (mlr_monitor_enabled && dry_level > 0 && (rec_armed_track >= 0 || sw == Switch::Up)) {
 			/* Latch channel/volume while the monitor is active so the
 			 * fade-out tail keeps using the right routing/gain after the
 			 * armed track or switch state changes. */
@@ -1196,6 +1208,7 @@ private:
 	uint16_t   autosave_master_ref_ = 0;          /* master level at the last user move */
 	uint32_t   delete_reset_flash_samples_remaining_ = 0;  /* confirmation flash countdown */
 	bool       delete_reset_fired_ = false;       /* require DELETE release before another reset */
+	uint32_t   monitor_flash_samples_remaining_ = 0;  /* REC key monitor on/off confirmation */
 	uint16_t   mon_fade_frac_ = 0;   /* monitor fade-in envelope, 0..256 */
 	uint16_t   mon_vol_last_  = 256; /* last-known armed/rec track volume_frac */
 	uint8_t    mon_ch_last_   = 0;   /* last-known armed/rec track recorded_channel */
@@ -2034,7 +2047,7 @@ private:
 		int16_t mix_l = mlr_play_mix_dual(&mix_r);
 		int32_t outL = (int32_t)mix_l;
 		int32_t outR = (int32_t)mix_r;
-		if (gl_recording_active_ && gl_record_track_ >= 0 && gl_record_track_ < MLR_NUM_TRACKS) {
+		if (mlr_monitor_enabled && gl_recording_active_ && gl_record_track_ >= 0 && gl_record_track_ < MLR_NUM_TRACKS) {
 			/* Route the input monitor to whichever output bus the
 			 * track being recorded will play back on, so what you
 			 * hear while recording matches the post-recording mix. */
@@ -3619,6 +3632,16 @@ private:
 			alt_bright = grid_render_delete_held_ ? 12 : 2;
 		}
 		grid.frameLedUnchecked(ac, 0, alt_bright);
+
+		/* REC key: monitor toggle confirmation over the page brightness */
+		if (monitor_flash_samples_remaining_ > 0) {
+			uint32_t elapsed = MONITOR_FLASH_SAMPLES - monitor_flash_samples_remaining_;
+			uint32_t phase = elapsed / DELETE_RESET_FLASH_PERIOD_SAMPLES;  /* 0..5 */
+			bool lit = mlr_monitor_enabled
+				? ((phase & 1u) == 0)             /* on: three quick flashes */
+				: (phase >= 1u && phase <= 4u);   /* off: one long flash */
+			grid.frameLedUnchecked(0, 0, lit ? 15 : 0);
+		}
 	}
 
 	/* Grid bottom row (row 7 when 6 tracks): master gradient bar.

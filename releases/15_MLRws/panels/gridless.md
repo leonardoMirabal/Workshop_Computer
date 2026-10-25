@@ -154,6 +154,11 @@ mid-recording does not switch inputs.
    delay (~½ second while the new audio is written to flash) the new
    recording begins looping from the start.
 
+Gridless mode has no control for the input monitor. It uses the setting saved
+from grid mode (hold DELETE and press the REC key, see
+[Input monitor](https://github.com/TomWhitwell/Workshop_Computer/blob/main/releases/15_MLRws/panels/grid.md#input-monitor)). With the monitor off, nothing from
+the inputs reaches the outputs while you record. Knob X still sets the record gain.
+
 The MLRws sample-manager web app still works in gridless mode: just plug the
 Computer into a computer running the web app and MLRws will silently switch
 into sample-manager mode for the duration of the connection, then return to

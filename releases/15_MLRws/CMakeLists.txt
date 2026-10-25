@@ -72,6 +72,7 @@ target_link_options(${CARD_NAME} PRIVATE -Wl,--print-memory-usage)
 
 option(MLR_PERF_PROFILING "Enable debugger-readable performance counters" OFF)
 option(MONOME_WS_FORCE_8X8_MONOBRIGHT "Force modern mext grids to behave like an 8x8 binary monobright grid for testing" OFF)
+option(MLR_MONITOR_DEFAULT_OFF "Start with the input monitor off when the scene has no monitor setting" OFF)
 option(CARD_STEREO "Deprecated; ignored because MLRws now builds one dual-mono firmware" OFF)
 mark_as_advanced(CARD_STEREO)
 
@@ -90,6 +91,7 @@ target_compile_definitions(${CARD_NAME} PRIVATE
 	MLR_SECTOR_SIZE=${MLR_FLASH_SECTOR_BYTES}
 	$<$<BOOL:${MONOME_WS_FORCE_8X8_MONOBRIGHT}>:MONOME_WS_FORCE_8X8_MONOBRIGHT=1>
 	$<$<BOOL:${MLR_PERF_PROFILING}>:MLR_PERF_PROFILING>
+	$<$<BOOL:${MLR_MONITOR_DEFAULT_OFF}>:MLR_MONITOR_DEFAULT_OFF>
 )
 
 target_include_directories(${CARD_NAME} PUBLIC ${CMAKE_CURRENT_LIST_DIR})

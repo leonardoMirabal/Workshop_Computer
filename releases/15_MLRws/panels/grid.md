@@ -103,6 +103,14 @@ The delete key is used to clear data from various places in MLRws. Hold it down 
 
 Hold the delete key by itself for 5 seconds to reset the current REC page parameters to defaults. The delete key flashes three times quickly to confirm. This resets current speed, reverse, loop, mixer level, gate mode, track groups, and active recall state, puts every track's pan back hard to its input side, opens every filter, and clears held CV pan offsets and rotations, then saves those defaults to flash. Currently playing patterns are stopped so they do not immediately re-apply old automation. It does **not** reset master volume, or delete audio, patterns, or saved recall slots.
 
+### Input monitor
+
+While a track is armed or recording, or with the switch Up, MLRws mixes the input into the outputs so you can hear what you record. Hold DELETE and press the REC page key (top left) to turn this monitor off or back on. The page doesn't change. The REC key flashes three times quickly when the monitor is on, and once, long, when it is off. The setting is saved with your other settings and also applies in [gridless mode](https://github.com/TomWhitwell/Workshop_Computer/blob/main/releases/15_MLRws/panels/gridless.md).
+
+With the monitor off, nothing from the inputs reaches the outputs. Knob X still sets the record gain, and recording and playback work as usual.
+
+The card has no analog through-path. The monitor is the input after the card has digitized it at 24 kHz, so it doesn't sound quite like the source. To hear the untouched source, split it before the card with a mult or a stackable cable, send one copy to Audio In and the other to your mixer, and turn the monitor off.
+
 ### Saving
 
 MLRws saves your settings to the card by itself, so they come back after a power cycle: speed, reverse, loops, levels, pan, filter, gate modes and the master level are written to flash within about 4 seconds of a change, and patterns, recalls and groups are saved as soon as you record, capture or clear them. Recorded audio is written to flash when the recording finishes.
