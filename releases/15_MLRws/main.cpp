@@ -11,8 +11,9 @@
  *
  * Row 0 layout (16-wide grid; 8x8 collapses Cols 4–7 → 3–6 and
  * Col 14 → Col 7, and omits the recall block):
- *   Col 0     = REC page
+ *   Col 0     = REC page (DELETE + REC: monitor Always / Armed / Off)
  *   Col 1     = CUT page
+ *   Col 2     = record flow (lit = Direct, dim = Switch; both grid sizes)
  *   Cols 4–7  = Pattern 1–4 (timed motion recorders)
  *   Cols 9–12 = Recall 1–4 (instant snapshot slots, 16-wide only)
  *   Col 14    = ALT modifier
@@ -22,6 +23,10 @@
  *   Speed-linked up to 1× — slower tape speeds affect recording and
  *   playback; faster settings remain playback-only.
  *   Records from position 0, variable length up to flash limit.
+ *   Direct flow (switch in the middle): tap the arm key of a track with
+ *   audio to record it (starts on release), tap again to stop; an empty
+ *   track arms and starts when its input passes -18 dBFS. Every start
+ *   keeps a 10 ms pre-roll.
  *
  * Knob Main      = master output volume
  * Audio In 1/2   = record source (per-track recorded_channel selects
@@ -121,7 +126,8 @@ volatile uint32_t mlr_perf_cmd_ack = 0;
 #endif
 #define DELETE_RESET_FLASH_PERIOD_SAMPLES (MLR_SAMPLE_RATE_HZ / 10u) /* 100 ms half-period */
 #define DELETE_RESET_FLASH_SAMPLES (DELETE_RESET_FLASH_PERIOD_SAMPLES * 6u)  /* three quick flashes */
-/* DELETE + REC key monitor toggle: same window, 3 quick flashes = on, 1 long = off */
+/* DELETE + REC key monitor mode cycle: same window, 3 quick flashes = Always,
+ * 2 quick = Armed, 1 long = Off */
 #define MONITOR_FLASH_SAMPLES      DELETE_RESET_FLASH_SAMPLES
 #define EXTRA_GUIDE_ENABLED 0x80u
 #define EXTRA_PATTERN_KEY_MASK 0x7Fu
@@ -129,6 +135,22 @@ volatile uint32_t mlr_perf_cmd_ack = 0;
 
 /* Monitor fade step per sample (Q8). 256/8 = 32 samples ≈ 1.3 ms fade. */
 #define MLR_MON_FADE_STEP 8
+
+/* Record pre-roll: the record path reads both inputs through this delay, so
+ * every start keeps the 10 ms before it (the attack that crossed the
+ * Direct-flow threshold). The monitor uses the live input. */
+#define PREROLL_SAMPLES        (MLR_SAMPLE_RATE_HZ / 100u)  /* 10 ms = 240 */
+/* Direct flow, empty armed track: start when a peak follower on the raw
+ * source (pre Knob X) passes -18 dBFS. Q12 envelope, ~1.3 ms attack and
+ * ~43 ms release (one-pole shifts at 24 kHz), and no start for 50 ms after
+ * arming. */
+#define MLR_AUTOREC_THRESHOLD  258   /* |x| of 2048 = -18 dBFS */
+#define AUTOREC_ATTACK_SHIFT   5
+#define AUTOREC_RELEASE_SHIFT  10
+#define AUTOREC_HOLDOFF_SAMPLES (MLR_SAMPLE_RATE_HZ / 20u)  /* 50 ms */
+/* Direct flow, 16-wide: both arm keys on a row with audio released within
+ * this time (and no pan key pressed) record A+B instead of being pan mode. */
+#define DIRECT_AB_TAP_US       300000u
 
 /* Record source for a track's recorded_channel. A+B is a saturating full
  * sum: each input stays at unity and Knob X tames hot signals. */
@@ -596,6 +618,8 @@ public:
 			rec_armed_track = -1;  /* disarm if flushing */
 			rec_gated = false;
 			rec_pulse_gated_ = false;
+			rec_auto_gated_ = false;
+			direct_start_pending_ = false;
 		}
 
 		/* Stop gated recording if switch returns to middle */
@@ -612,8 +636,10 @@ public:
 			mlr_start_record(rec_armed_track);
 			rec_speed_accum = 0;
 		}
-		/* Stop recording if switch returns to middle or armed track changes */
-		if (mlr_rec_track >= 0 && !rec_gated && !rec_pulse_gated_ && (!rec_modifier || rec_armed_track != mlr_rec_track)) {
+		/* Stop recording if switch returns to middle or armed track changes.
+		 * Pulse-gated and Direct-flow takes have their own stop. */
+		if (mlr_rec_track >= 0 && !rec_gated && !rec_pulse_gated_ && !rec_auto_gated_ &&
+		    (!rec_modifier || rec_armed_track != mlr_rec_track)) {
 			mlr_stop_record();
 			rec_speed_accum = 0;
 			if (rec_armed_track >= 0 && rec_modifier && rec_armed_track != mlr_rec_track && !mlr_flushing && !rec_limit_latched && rec_start_lockout_samples_ == 0) {
@@ -643,6 +669,8 @@ public:
 			/* Orphaned flag (rec ended via some other path) — clear. */
 			rec_pulse_gated_ = false;
 		}
+		if (rec_auto_gated_ && mlr_rec_track < 0)
+			rec_auto_gated_ = false;
 		if (PulseIn1RisingEdge()) {
 			for (int t = 0; t < MLR_NUM_TRACKS; t++) {
 				if (mlr_tracks[t].playing && mlr_tracks[t].loop_active) {
@@ -690,26 +718,54 @@ public:
 
 		PERF_UI_SECTION_START(2);
 		/* ---- speed-linked recording (capped at 1x) ---- */
-		int16_t dry_in;
-		{
-			int audio_in1 = (int)AudioIn1();
-			int audio_in2 = (int)AudioIn2();
-			/* Default to the last-known monitor channel so a disarm during
-			 * monitor fade-out doesn't flip dry_in between AudioIn1/AudioIn2
-			 * in a single sample (which would click through the envelope). */
-			uint8_t rec_ch = mon_ch_last_;
-			int route_track = (mlr_rec_track >= 0) ? mlr_rec_track : rec_armed_track;
-			if (route_track >= 0) rec_ch = mlr_tracks[route_track].recorded_channel;
-			dry_in = record_source_in(rec_ch, audio_in1, audio_in2);
-		}
+		int audio_in1 = (int)AudioIn1();
+		int audio_in2 = (int)AudioIn2();
+		/* Default to the last-known monitor channel so a disarm during
+		 * monitor fade-out doesn't flip dry_in between AudioIn1/AudioIn2
+		 * in a single sample (which would click through the envelope). */
+		uint8_t rec_ch = mon_ch_last_;
+		int route_track = (mlr_rec_track >= 0) ? mlr_rec_track : rec_armed_track;
+		if (route_track >= 0) rec_ch = mlr_tracks[route_track].recorded_channel;
+		int16_t dry_in = record_source_in(rec_ch, audio_in1, audio_in2);  /* live: monitor, meter, trigger */
+		/* Pre-roll: both inputs go through the delay, so a source change at a
+		 * start (tap, A+B key) never puts the old input in the lead-in. */
+		uint32_t preroll_out = preroll_[preroll_pos_];
+		preroll_[preroll_pos_] = (uint32_t)(uint16_t)audio_in1 | ((uint32_t)(uint16_t)audio_in2 << 16);
+		if (++preroll_pos_ >= PREROLL_SAMPLES) preroll_pos_ = 0;
 		uint8_t dry_level = (uint8_t)(x_knob_filtered_ >> 4);  /* 0–255, from LPF'd Knob::X */
+
+		/* ---- Direct flow: start the armed track (switch in the middle) ----
+		 * A tap on a track with audio sets direct_start_pending_; an empty
+		 * track listens until its raw source (pre Knob X) passes the
+		 * threshold. Same guards as the switch start. */
+		if (rec_armed_track >= 0 && mlr_rec_track < 0 && !rec_modifier &&
+		    mlr_rec_flow == MLR_REC_FLOW_DIRECT) {
+			bool go = direct_start_pending_;
+			if (!go && !mlr_tracks[rec_armed_track].has_content) {
+				int32_t x = (int32_t)(dry_in < 0 ? -dry_in : dry_in) << 12;
+				int32_t e = autorec_env_q12_;
+				if (x > e) e += (x - e) >> AUTOREC_ATTACK_SHIFT;
+				else       e -= (e - x) >> AUTOREC_RELEASE_SHIFT;
+				autorec_env_q12_ = e;
+				if (autorec_holdoff_samples_ > 0)
+					autorec_holdoff_samples_--;
+				else if (e > (MLR_AUTOREC_THRESHOLD << 12))
+					go = true;
+			}
+			if (go && !mlr_flushing && !rec_limit_latched && rec_start_lockout_samples_ == 0)
+				start_direct_record(rec_armed_track);
+		}
+
 		if (mlr_rec_track >= 0) {
 			/* Recording captures the input scaled only by the input gain knob.
 			 * The mixer slot is a playback control and is applied during
 			 * playback (mlr_play_mix_dual_sum) and during monitoring
 			 * (section 5 below); applying it here too would double-attenuate
-			 * the audio on playback. */
-			int32_t scaled = ((int32_t)dry_in * (int32_t)dry_level) >> 8;
+			 * the audio on playback. The source is the pre-roll output. */
+			int16_t rec_in = record_source_in(mlr_tracks[mlr_rec_track].recorded_channel,
+			                                  (int16_t)(preroll_out & 0xFFFFu),
+			                                  (int16_t)(preroll_out >> 16));
+			int32_t scaled = ((int32_t)rec_in * (int32_t)dry_level) >> 8;
 			if (scaled > 2047) scaled = 2047;
 			if (scaled < -2048) scaled = -2048;
 			uint16_t spd = mlr_tracks[mlr_rec_track].speed_frac;
@@ -725,6 +781,7 @@ public:
 					rec_armed_track = -1;  /* disarm when limit reached */
 					rec_gated = false;
 					rec_pulse_gated_ = false;
+					rec_auto_gated_ = false;
 					break;
 				}
 			}
@@ -739,12 +796,24 @@ public:
 			bool alt_held = delete_action_held();
 			int pcs = pat_col_start();
 			if (col == 0 && alt_held) {
-				/* DELETE + REC: toggle the input monitor. No page switch, and
-				 * no mlr_* event, so patterns never record it. */
-				mlr_monitor_enabled = !mlr_monitor_enabled;
+				/* DELETE + REC: cycle the input monitor Always -> Armed -> Off.
+				 * No page switch, and no mlr_* event, so patterns never record it. */
+				uint8_t m = mlr_monitor_mode;
+				mlr_monitor_mode = (m == MLR_MON_ALWAYS) ? MLR_MON_ARMED
+				                 : (m == MLR_MON_ARMED)  ? MLR_MON_OFF
+				                 :                         MLR_MON_ALWAYS;
 				monitor_flash_samples_remaining_ = MONITOR_FLASH_SAMPLES;
 				note_settings_changed();
 				page_switched = true;  /* consume the key, like page navigation */
+			}
+			else if (col == 2) {
+				/* Record flow: Switch (arm + switch) <-> Direct (tap records).
+				 * A take or a listening arm in progress carries on. */
+				mlr_rec_flow = (mlr_rec_flow == MLR_REC_FLOW_DIRECT)
+					? MLR_REC_FLOW_SWITCH : MLR_REC_FLOW_DIRECT;
+				direct_start_pending_ = false;
+				note_settings_changed();
+				page_switched = true;
 			}
 			else if (col == 0) {
 				bool leaving_cut = (play_page == PAGE_CUT);
@@ -951,7 +1020,16 @@ public:
 		int16_t mix = mlr_play_mix_dual(&mix_r);
 		int32_t outL = (int32_t)mix;
 		int32_t outR = (int32_t)mix_r;
-		if (mlr_monitor_enabled && dry_level > 0 && (rec_armed_track >= 0 || sw == Switch::Up)) {
+		/* Monitor: Armed mode = while armed/recording/switch Up, routed like
+		 * the track. Always mode adds stereo through (In 1 -> Out 1, In 2 ->
+		 * Out 2) while nothing is armed or recording. A routing change fades
+		 * out, swaps, then fades back in, so it never clicks. */
+		uint8_t mon_mode = mlr_monitor_mode;
+		bool mon_track_busy = (rec_armed_track >= 0 || mlr_rec_track >= 0);
+		bool mon_want = dry_level > 0 && mon_mode != MLR_MON_OFF &&
+		                (rec_armed_track >= 0 || sw == Switch::Up || mon_mode == MLR_MON_ALWAYS);
+		bool mon_want_thru = (mon_mode == MLR_MON_ALWAYS) && !mon_track_busy;
+		if (mon_want && mon_want_thru == mon_thru_) {
 			/* Latch channel/volume while the monitor is active so the
 			 * fade-out tail keeps using the right routing/gain after the
 			 * armed track or switch state changes. */
@@ -968,9 +1046,15 @@ public:
 			mon_fade_frac_ = (mon_fade_frac_ <= MLR_MON_FADE_STEP)
 				? 0u
 				: (uint16_t)(mon_fade_frac_ - MLR_MON_FADE_STEP);
+		} else if (mon_want) {
+			mon_thru_ = mon_want_thru;  /* faded out: take the new routing */
 		}
 
-		if (mon_fade_frac_ > 0) {
+		if (mon_fade_frac_ > 0 && mon_thru_) {
+			int32_t g = ((int32_t)dry_level * (int32_t)mon_fade_frac_) >> 8;
+			outL += ((int32_t)audio_in1 * g) >> 8;
+			outR += ((int32_t)audio_in2 * g) >> 8;
+		} else if (mon_fade_frac_ > 0) {
 			int32_t in_scaled = ((int32_t)dry_in * (int32_t)dry_level) >> 8;
 			in_scaled = (in_scaled * (int32_t)mon_vol_last_) >> 8;
 			in_scaled = (in_scaled * (int32_t)mon_fade_frac_) >> 8;
@@ -1138,6 +1222,15 @@ private:
 	int        resume_after_arm_track_ = -1; /* track auto-stopped due to arm; resume on disarm */
 	bool       rec_gated = false;    /* true during press-to-record (gated) */
 	bool       rec_pulse_gated_ = false; /* true while recording was started by Pulse In 1 rising edge */
+	bool       rec_auto_gated_ = false;  /* true while a Direct-flow take runs (tap or input level):
+	                                      * the switch doesn't stop it, an arm key does */
+	bool       direct_start_pending_ = false;  /* Direct flow: start the armed track as soon as allowed */
+	int32_t    autorec_env_q12_ = 0;          /* Direct flow listening: peak follower, Q12 */
+	uint16_t   autorec_holdoff_samples_ = 0;  /* ...no start until this runs out after arming */
+	uint16_t   preroll_pos_ = 0;
+	/* Record pre-roll: In 1 (low) | In 2 (high), int16 each. Static, so the
+	 * card object (on main's stack) doesn't grow by 960 B. */
+	inline static uint32_t preroll_[PREROLL_SAMPLES] = {};
 	uint32_t   rec_auto_stop_samples_ = MLR_MAX_SAMPLES; /* overwrite records stop at previous length */
 	int        master_knob_arm_raw_ = -1;
 	int        master_knob_last_raw_ = -1;
@@ -1231,6 +1324,7 @@ private:
 	uint16_t   mon_vol_last_  = 256; /* last-known armed/rec track volume_frac */
 	uint8_t    mon_ch_last_   = 0;   /* last-known armed/rec track recorded_channel */
 	uint16_t   mon_gl_last_   = 32768u, mon_gr_last_ = 0;  /* ...and its pan gains */
+	bool       mon_thru_      = false; /* monitor routing: stereo through (Always, nothing armed) */
 	volatile int8_t pan_mode_track_ = -1; /* REC page pan mode (both arm keys held), -1 = off */
 	volatile uint8_t lpf_hold_mask_ = 0;   /* REC page: reverse keys held -> those rows show/set the low-pass */
 	uint8_t    lpf_edited_mask_ = 0;       /* a cutoff key was pressed during that row's hold */
@@ -2064,7 +2158,7 @@ private:
 		int16_t mix_l = mlr_play_mix_dual(&mix_r);
 		int32_t outL = (int32_t)mix_l;
 		int32_t outR = (int32_t)mix_r;
-		if (mlr_monitor_enabled && gl_recording_active_ && gl_record_track_ >= 0 && gl_record_track_ < MLR_NUM_TRACKS) {
+		if (mlr_monitor_mode != MLR_MON_OFF && gl_recording_active_ && gl_record_track_ >= 0 && gl_record_track_ < MLR_NUM_TRACKS) {
 			/* Route the input monitor to whichever output bus the
 			 * track being recorded will play back on, so what you
 			 * hear while recording matches the post-recording mix. */
@@ -2505,6 +2599,22 @@ private:
 
 		int sw_now = SwitchVal();
 		bool rec_pos = (sw_now == Switch::Up || sw_now == Switch::Down);
+		/* Direct flow, switch in the middle: the arm keys record. */
+		bool direct = !rec_pos && mlr_rec_flow == MLR_REC_FLOW_DIRECT;
+
+		/* A Direct take (tap or input level) stops on any arm key. Its own
+		 * row keeps the input keys first (unlit key = switch input, other
+		 * key held = A+B), so that row stops below. */
+		if (rec_auto_gated_ && mlr_rec_track >= 0 && track != mlr_rec_track) {
+			stop_direct_record();
+			return;
+		}
+
+		/* This tap starts a fresh recording over the track's audio, so its
+		 * old header needn't be rewritten for a new input (that would
+		 * flush and disarm it). */
+		bool direct_take = direct && mlr_rec_track < 0 && rec_armed_track != track &&
+		                   mlr_tracks[track].has_content;
 
 		/* 16-wide grid: col 0 = ch1, col 1 = ch2, both keys on the row = A+B. */
 		if (!small_grid_) {
@@ -2513,9 +2623,10 @@ private:
 			/* Hard-panned track, nothing armed/recording, switch in the middle:
 			 * the other side's arm key hops it across instead of arming, so
 			 * playback carries on. The same side's key still arms. A+B
-			 * ignores pan, so it never hops, nor does the A+B key pair. */
+			 * ignores pan, so it never hops, nor does the A+B key pair. In
+			 * Direct flow a tap records that input instead. */
 			int pan = mlr_tracks[track].pan;
-			bool hop_ok = mlr_pan_enabled && !rec_pos && rec_armed_track < 0 && mlr_rec_track < 0 &&
+			bool hop_ok = mlr_pan_enabled && !rec_pos && !direct && rec_armed_track < 0 && mlr_rec_track < 0 &&
 			              ch != MLR_CH_AB && !other_held;
 			if (hop_ok && pan == -MLR_PAN_STEPS && column == 1) {
 				group_set_pan(track, MLR_PAN_STEPS);
@@ -2529,16 +2640,22 @@ private:
 				/* Hold one arm key, press the other: record In 1 + In 2. An
 				 * armed or recording row stays so (a punch-in started by the
 				 * first key switches to the sum); otherwise arm it below. */
-				set_track_recorded_channel(track, MLR_CH_AB, true);
+				set_track_recorded_channel(track, MLR_CH_AB, !direct_take);
 				if (rec_armed_track == track || mlr_rec_track == track) return;
 			} else if (rec_armed_track == track && ch != MLR_CH_AB &&
 			           ch != (uint8_t)column) {
 				set_track_recorded_channel(track, (uint8_t)column, true);
 				return;
 			} else if (rec_armed_track != track) {
-				set_track_recorded_channel(track, (uint8_t)column, true);
+				set_track_recorded_channel(track, (uint8_t)column, !direct_take);
 			}
 			/* Armed A+B (both keys lit): a tap on either key disarms below. */
+		}
+
+		/* The Direct take's lit key (either key of an A+B take) stops it. */
+		if (rec_auto_gated_ && mlr_rec_track == track) {
+			stop_direct_record();
+			return;
 		}
 
 		if (rec_pos && rec_armed_track < 0 && mlr_rec_track < 0 && !mlr_flushing && !rec_limit_latched && rec_start_lockout_samples_ == 0) {
@@ -2552,8 +2669,47 @@ private:
 			} else {
 				set_armed_track(track);
 				rec_limit_latched = false;
+				/* Direct flow: a track with audio records now (ProcessSample
+				 * starts it, after any post-take lockout); an empty one
+				 * listens for the input. */
+				if (direct_take) direct_start_pending_ = true;
 			}
 		}
+	}
+
+	/* Direct flow: start a take on the armed track. Same path as a Pulse In 2
+	 * start; the switch never stops it (rec_auto_gated_), an arm key does. */
+	void __not_in_flash("start_direct_record") start_direct_record(int track)
+	{
+		if (resume_after_arm_track_ == track)
+			resume_after_arm_track_ = -1;
+		if (mlr_tracks[track].playing)
+			mlr_stop_track(track);
+		mlr_start_record(track);
+		rec_speed_accum = 0;
+		rec_auto_gated_ = true;
+		direct_start_pending_ = false;
+	}
+
+	void __not_in_flash("stop_direct_record") stop_direct_record()
+	{
+		mlr_stop_record();
+		rec_speed_accum = 0;
+		rec_auto_gated_ = false;
+		direct_start_pending_ = false;
+	}
+
+	/* Direct flow, 16-wide: both arm keys tapped on a row with audio (it
+	 * entered pan mode, see process_pan_gesture): record A+B now. */
+	void __not_in_flash("direct_ab_tap") direct_ab_tap(int track)
+	{
+		int sw_now = SwitchVal();
+		if (sw_now == Switch::Up || sw_now == Switch::Down) return;
+		if (rec_armed_track >= 0 || mlr_rec_track >= 0 || mlr_flushing || delete_action_held()) return;
+		set_track_recorded_channel(track, MLR_CH_AB, false);  /* the take writes a new header */
+		set_armed_track(track);
+		rec_limit_latched = false;
+		if (mlr_tracks[track].has_content) direct_start_pending_ = true;
 	}
 
 	void process_delete_reset_hold()
@@ -2636,6 +2792,7 @@ private:
 		if (track == rec_armed_track) {
 			resume_armed_track_if_needed(track);
 			rec_armed_track = -1;
+			direct_start_pending_ = false;
 			return;
 		}
 
@@ -2643,6 +2800,10 @@ private:
 			resume_armed_track_if_needed(rec_armed_track);
 
 		rec_armed_track = track;
+		/* Direct flow: a fresh arm listens from silence, after the hold-off. */
+		direct_start_pending_ = false;
+		autorec_env_q12_ = 0;
+		autorec_holdoff_samples_ = AUTOREC_HOLDOFF_SAMPLES;
 
 		/* Plug auto-detect: if the user has not explicitly picked a channel
 		 * for this track, and exactly one of Audio1/Audio2 is connected,
@@ -2903,6 +3064,8 @@ private:
 	int  pan_exit_track_ = -1;  /* row whose arm keys are still swallowed after pan mode */
 	int  arm_gesture_track_ = -1;  /* row whose arm-key hold began armed/recording: its
 	                                * second key picks A+B, even if the first disarmed it */
+	bool pan_mode_edited_ = false;    /* a pan key was pressed in this pan mode */
+	uint32_t pan_mode_enter_us_ = 0;  /* when pan mode began (Direct flow A+B tap) */
 	void __not_in_flash("process_pan_gesture") process_pan_gesture()
 	{
 		pan_gesture_consumed_ = false;
@@ -2915,6 +3078,11 @@ private:
 			if (track == pan_mode_track_) {
 				pan_mode_track_ = -1;  /* either arm key up ends pan mode */
 				pan_gesture_consumed_ = true;
+				/* Direct flow: a quick two-key tap with no pan key is the A+B
+				 * record gesture (recording starts on release, like a tap). */
+				if (mlr_rec_flow == MLR_REC_FLOW_DIRECT && !pan_mode_edited_ &&
+				    (time_us_32() - pan_mode_enter_us_) < DIRECT_AB_TAP_US)
+					direct_ab_tap(track);
 			} else if (pan_exit_track_ == track) {
 				pan_gesture_consumed_ = true;  /* the other arm key's later release */
 				if ((grid.heldRowMask((uint8_t)row) & 0x3u) == 0) pan_exit_track_ = -1;
@@ -2932,6 +3100,8 @@ private:
 		if (track == arm_gesture_track_ || mlr_tracks[track].recorded_channel == MLR_CH_AB) return;
 		pan_mode_track_ = (int8_t)track;
 		pan_exit_track_ = track;
+		pan_mode_edited_ = false;
+		pan_mode_enter_us_ = time_us_32();
 		reset_copy_gesture();  /* the first arm key started a copy/arm; cancel it */
 		pan_gesture_consumed_ = true;
 		copy_arm_suppress_event_ = true;
@@ -3443,8 +3613,10 @@ private:
 		int column = grid.lastX();
 		if (track == pan_mode_track_) {
 			/* keys 3..16 set pan; keys 9 and 10 are both centre */
-			if (column >= 2 && column <= 15)
+			if (column >= 2 && column <= 15) {
 				group_set_pan(track, pan_col_to_value(column));
+				pan_mode_edited_ = true;
+			}
 			return;
 		}
 		if (dissolve_group_if_delete_touch(track)) return;
@@ -3681,13 +3853,17 @@ private:
 		}
 		grid.frameLedUnchecked(ac, 0, alt_bright);
 
-		/* REC key: monitor toggle confirmation over the page brightness */
+		/* Record flow: lit = Direct, dim = Switch */
+		grid.frameLedUnchecked(2, 0, mlr_rec_flow == MLR_REC_FLOW_DIRECT ? 12 : 3);
+
+		/* REC key: monitor mode confirmation over the page brightness */
 		if (monitor_flash_samples_remaining_ > 0) {
 			uint32_t elapsed = MONITOR_FLASH_SAMPLES - monitor_flash_samples_remaining_;
 			uint32_t phase = elapsed / DELETE_RESET_FLASH_PERIOD_SAMPLES;  /* 0..5 */
-			bool lit = mlr_monitor_enabled
-				? ((phase & 1u) == 0)             /* on: three quick flashes */
-				: (phase >= 1u && phase <= 4u);   /* off: one long flash */
+			uint8_t m = mlr_monitor_mode;
+			bool lit = (m == MLR_MON_ALWAYS) ? ((phase & 1u) == 0)           /* three quick flashes */
+			         : (m == MLR_MON_ARMED)  ? (phase == 0u || phase == 2u)  /* two quick flashes */
+			         :                         (phase >= 1u && phase <= 4u); /* Off: one long flash */
 			grid.frameLedUnchecked(0, 0, lit ? 15 : 0);
 		}
 	}
@@ -3767,6 +3943,7 @@ private:
 		bool recording = (mlr_rec_track >= 0);
 		bool rec_pos = grid_render_rec_pos_;
 		bool gated_rec_ready = rec_pos && rec_armed_track < 0;
+		bool direct_flow = !rec_pos && mlr_rec_flow == MLR_REC_FLOW_DIRECT;
 
 		int pc = play_col();
 		bool alt_held = grid_render_delete_action_held_;
@@ -3779,12 +3956,15 @@ private:
 			bool has = mlr_tracks[t].has_content;
 			bool armed = (rec_armed_track == t);
 			bool actively_rec = (recording && t == mlr_rec_track);
+			bool listening = direct_flow && !has;  /* Direct flow: an armed empty track */
 
 			/* col 0 (and col 1 on 16-wide): paired channel-select + arm/status indicator.
 			 * On 8x8 grids only col 0 is the arm indicator. */
 			uint8_t state_bright;
 			if (actively_rec) {
 				state_bright = (rec_blink & 2) ? 15 : 4;
+			} else if (armed && listening) {
+				state_bright = (rec_blink & 0xA) ? 3 : 12;  /* double blink: waiting for the input */
 			} else if (armed) {
 				state_bright = (rec_blink & 8) ? 12 : 3;
 			} else if (gated_rec_ready) {

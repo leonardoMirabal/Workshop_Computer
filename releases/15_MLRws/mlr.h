@@ -428,14 +428,27 @@ extern volatile uint8_t mlr_cv2_mode;    /* what CV In 2 drives on its target tr
 #define MLR_CV_TARGET_ALL      ((1u << MLR_NUM_TRACKS) - 1u)
 extern volatile uint8_t mlr_cv1_target;  /* CV In 1: pan offset */
 extern volatile uint8_t mlr_cv2_target;  /* CV In 2: filter cutoff / rotation */
-/* Mix the dry input into the outputs while armed/recording/switch Up
- * (scene; default on, or off with the MLR_MONITOR_DEFAULT_OFF build option). */
-#ifdef MLR_MONITOR_DEFAULT_OFF
-#define MLR_MONITOR_DEFAULT    false
-#else
-#define MLR_MONITOR_DEFAULT    true
+/* Input monitor mode (scene): Off = never mix the dry input into the
+ * outputs; Armed = while armed/recording/switch Up; Always = also with
+ * nothing armed (stereo through, In 1 -> Out 1, In 2 -> Out 2). The
+ * MLR_MONITOR_DEFAULT_MODE build option sets the mode for scenes without
+ * the setting (default Armed). */
+#define MLR_MON_OFF            0u
+#define MLR_MON_ARMED          1u
+#define MLR_MON_ALWAYS         2u
+#ifndef MLR_MONITOR_DEFAULT_MODE
+#define MLR_MONITOR_DEFAULT_MODE MLR_MON_ARMED
 #endif
-extern volatile bool   mlr_monitor_enabled;
+#if MLR_MONITOR_DEFAULT_MODE > 2
+#error "MLR_MONITOR_DEFAULT_MODE must be 0 (off), 1 (armed) or 2 (always)"
+#endif
+extern volatile uint8_t mlr_monitor_mode;
+/* Record flow (scene): Switch = arm, then the switch records; Direct =
+ * a tap on an arm key records a track with audio at once, and arms an
+ * empty track to start on the input level. */
+#define MLR_REC_FLOW_SWITCH    0u
+#define MLR_REC_FLOW_DIRECT    1u
+extern volatile uint8_t mlr_rec_flow;
 extern volatile int    mlr_recall_active;  /* currently selected recall (-1=none) */
 
 /* Per-track group-membership bitmask (see mlr.c for invariant). */

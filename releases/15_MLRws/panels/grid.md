@@ -6,7 +6,7 @@ Everything here works the same whether the grid is plugged straight into the Com
 
 ## Hardware in and out
 
-In grid mode the interface on the Computer itself is intentionally minimal. Tracks are recorded as mono ADPCM, and each one can be [panned](#pan) anywhere between **Audio Out 1** and **Audio Out 2** and run through its own [low-pass filter](#filter). **Knob X** is the input gain and the monitor level while armed/recording. **Knob Main** is the master output volume.
+In grid mode the interface on the Computer itself is intentionally minimal. Tracks are recorded as mono ADPCM, and each one can be [panned](#pan) anywhere between **Audio Out 1** and **Audio Out 2** and run through its own [low-pass filter](#filter). **Knob X** is the input gain and the [monitor](#input-monitor) level. **Knob Main** is the master output volume.
 
 **Audio In 1 / Audio In 2** are the record sources: which input is captured into a track is set by that track's input selection on the REC page (or auto-picked from whichever single input is plugged in if you haven't chosen).
 
@@ -61,6 +61,10 @@ The keys at each of the four grid edges have common functionality no matter whic
 
 The two grid keys at the top left of the grid control which page is selected between page 1: [CUT](#cut-page-playhead-cutting-and-loop-a-section) and page 2: [REC](#rec-page-input-pan-mixer-reverse-filter-and-speed).
 
+### Record flow
+
+The third key in the top row (col 2, on 16-wide and 8x8 grids) chooses how recording works. **Dim = Switch flow**: arm a track, then move the switch to record (as in earlier versions). **Lit = Direct flow**: a tap on a track's arm key records, as on mlr/mlre for norns. See [Recording](#recording). The setting works on both pages, is saved with your other settings, and patterns and recalls never change it.
+
 ### Pattern looper
 
 Patterns are **timed motion recorders**. They capture every grid-based event you
@@ -105,9 +109,13 @@ Hold the delete key by itself for 5 seconds to reset the current REC page parame
 
 ### Input monitor
 
-While a track is armed or recording, or with the switch Up, MLRws mixes the input into the outputs so you can hear what you record. Hold DELETE and press the REC page key (top left) to turn this monitor off or back on. The page doesn't change. The REC key flashes three times quickly when the monitor is on, and once, long, when it is off. The setting is saved with your other settings and also applies in [gridless mode](https://github.com/TomWhitwell/Workshop_Computer/blob/main/releases/15_MLRws/panels/gridless.md).
+MLRws can mix the input into the outputs so you can hear what you record. **Knob X** sets its level. There are three modes:
 
-With the monitor off, nothing from the inputs reaches the outputs. Knob X still sets the record gain, and recording and playback work as usual.
+- **Armed** (the default): while a track is armed or recording, or with the switch Up. The input follows the armed track's level and pan (an A+B track plays the sum on both outputs).
+- **Always**: as Armed, and also while nothing is armed or recording. Then it's a stereo through: Audio In 1 to Audio Out 1, Audio In 2 to Audio Out 2. When you arm a track, the monitor fades over to that track's routing in about a millisecond, so it doesn't click.
+- **Off**: nothing from the inputs reaches the outputs. Knob X still sets the record gain, and recording and playback work as usual.
+
+Hold DELETE and press the REC page key (top left) to step through Always, Armed and Off. The page doesn't change. The REC key confirms the new mode: three quick flashes = Always, two quick flashes = Armed, one long flash = Off. The setting is saved with your other settings. [Gridless mode](https://github.com/TomWhitwell/Workshop_Computer/blob/main/releases/15_MLRws/panels/gridless.md) monitors only while it records, in both Armed and Always; Off silences it there too.
 
 The card has no analog through-path. The monitor is the input after the card has digitized it at 24 kHz, so it doesn't sound quite like the source. To hear the untouched source, split it before the card with a mult or a stackable cable, send one copy to Audio In and the other to your mixer, and turn the monitor off.
 
@@ -167,7 +175,8 @@ More details in [Recording](#recording)
 On 16-wide grids each track can sit anywhere between Audio Out 1 and Audio Out 2, using an equal-power pan law (13 positions, from hard Out 1 through centre to hard Out 2).
 
 - **Pan mode**: with the switch in the middle and nothing armed or recording, hold **both** keys in cols 0 and 1 on a track row. The rest of that row turns into a pan display: cols 2–7 are the six steps toward Out 1, cols 8 and 9 together are centre, and cols 10–15 are the six steps toward Out 2. Press a key to move the pan there. Release either arm key to leave pan mode (it doesn't arm or record).
-- **Hop**: when a track is panned hard to one side, a single press on the *other* side's key (col 0 or col 1) hops it across to the opposite side, without arming and without interrupting playback. Pressing the key on the side it's already on arms as usual.
+- **Hop**: when a track is panned hard to one side, a single press on the *other* side's key (col 0 or col 1) hops it across to the opposite side, without arming and without interrupting playback. Pressing the key on the side it's already on arms as usual. In [Direct record flow](#direct-recording) there is no hop: a single press records.
+- In Direct record flow, a quick tap of both keys (released within about 0.3 s without pressing a pan key) records A+B instead of leaving pan mode.
 - **Glide**: on a playing track, pan moves glide at 100 ms per step, so a full hop takes about 1.2 seconds. Stopped tracks jump straight there.
 
 Pan is saved, recorded into patterns, and captured by recalls. [CV In 1](#cv-inputs) can offset it.
@@ -247,10 +256,12 @@ matches what you'll capture. The track level from the grid mixer is applied to m
 
 When the maximum recording length is reached the track auto-stops.
 
-The card writes the new audio to flash after the switch
-returns to middle- and recordings are therefore persisted on the card itself. 
+Every recording keeps the 10 ms of input just before it starts (a short
+pre-roll), so the attack that started it isn't cut off.
 
-There are two ways to record:
+The card writes the new audio to flash when the recording stops, and recordings are therefore persisted on the card itself.
+
+The [record flow](#record-flow) key (top row, col 2) picks how you record. In **Switch flow** (dim) there are two ways, armed and quick recording. **Direct flow** (lit) adds tap-to-record, and armed and quick recording still work with the switch.
 
 #### Armed recording
 
@@ -267,3 +278,14 @@ If no track is armed and the switch is already Up or Down, go to the REC page an
 col 0 on a track row. Recording runs for as long as you hold the key (or
 until the switch returns to middle, or the track fills up). This is the
 fastest way to grab a quick stab.
+
+#### Direct recording
+
+With the record flow key lit and the switch at **Middle**, the arm keys on the REC page record by themselves:
+
+- **A track with audio**: tap its arm key and a new recording starts over it at once. Holding that key and touching an empty track's arm key copies the track there instead, so the recording starts when you **release** the key. The LED goes to a fast blink. Tap the lit key again to stop: the track plays at once, as when the switch returns to Middle.
+- **An empty track**: tap its arm key to arm it and listen. The LED double-blinks. The recording starts by itself the first time the input passes about −18 dBFS (measured before Knob X, so the knob doesn't change the sensitivity). The first 50 ms after arming never start it. Tap the key again while it listens to disarm it, or while it records to stop it.
+- **Input**: on 16-wide grids col 0 records Audio In 1 and col 1 records Audio In 2. While a track listens or records, a tap on its unlit key switches it to that input. For A+B, hold one key and press the other on a listening or recording track, or, on a track with audio, tap both keys together (release them within about 0.3 s without pressing a pan key; a longer hold is [pan mode](#pan)). On 8x8 grids the input is picked automatically, as when arming.
+- While a direct recording runs, the switch doesn't stop it. Tapping an arm key on another row stops it too.
+- With a track armed or listening, moving the switch Up or Down starts it as an armed recording, and Pulse In 2 records it for as long as the gate is high. Quick recording works as usual. The [hop](#pan) is off in Direct flow, so a tap always records.
+- When the maximum length is reached the recording stops, as usual. After any recording the card writes it to flash and then waits about 0.5 s before the next one can start. A tap on a track with audio during that wait records it as soon as the wait ends.

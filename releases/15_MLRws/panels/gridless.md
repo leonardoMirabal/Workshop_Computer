@@ -161,7 +161,8 @@ mid-recording does not switch inputs.
 
 Gridless mode has no control for the input monitor. It uses the setting saved
 from grid mode (hold DELETE and press the REC key, see
-[Input monitor](https://github.com/TomWhitwell/Workshop_Computer/blob/main/releases/15_MLRws/panels/grid.md#input-monitor)). With the monitor off, nothing from
+[Input monitor](https://github.com/TomWhitwell/Workshop_Computer/blob/main/releases/15_MLRws/panels/grid.md#input-monitor)). In Armed and Always mode it
+monitors while you record, as described above. With the monitor off, nothing from
 the inputs reaches the outputs while you record. Knob X still sets the record gain.
 
 The MLRws sample-manager web app still works in gridless mode: just plug the

@@ -47,7 +47,8 @@ volatile bool   mlr_settings_save_pending = false;
 volatile uint8_t mlr_cv2_mode = MLR_CV2_MODE_FILTER;
 volatile uint8_t mlr_cv1_target = MLR_CV_TARGET_LAST;
 volatile uint8_t mlr_cv2_target = MLR_CV_TARGET_LAST;
-volatile bool   mlr_monitor_enabled = MLR_MONITOR_DEFAULT;
+volatile uint8_t mlr_monitor_mode = MLR_MONITOR_DEFAULT_MODE;
+volatile uint8_t mlr_rec_flow = MLR_REC_FLOW_SWITCH;
 volatile bool   mlr_pan_enabled = false;
 volatile int    mlr_recall_active = -1;
 static uint32_t mlr_clock_ms = 0;
@@ -1134,7 +1135,8 @@ void MLR_COLD_FUNC mlr_init(void)
 	mlr_rot_range_pct = MLR_ROT_RANGE_DEFAULT;
 	mlr_cv2_mode = MLR_CV2_MODE_FILTER;
 	mlr_cv1_target = mlr_cv2_target = MLR_CV_TARGET_LAST;
-	mlr_monitor_enabled = MLR_MONITOR_DEFAULT;
+	mlr_monitor_mode = MLR_MONITOR_DEFAULT_MODE;
+	mlr_rec_flow = MLR_REC_FLOW_SWITCH;
 	for (int t = 0; t < MLR_NUM_TRACKS; t++) {
 		mlr_set_pan(t, mlr_pan_default(t));  /* until the scene says otherwise */
 		mlr_set_lpf(t, MLR_LPF_OPEN);
@@ -2961,7 +2963,9 @@ void mlr_recall_clear(int slot)
  *   [...]  cv2_version (uint8_t) + mlr_cv2_mode (uint8_t)              (2 bytes)
  *   [...]  cvt_version (uint8_t) + mlr_cv1_target + mlr_cv2_target    (3 bytes)
  *          (v2: track masks; v1: 0 = last touched, 1..6 = one track)
- *   [...]  mon_version (uint8_t) + mlr_monitor_enabled (uint8_t)       (2 bytes)
+ *   [...]  mon_version (uint8_t) + mlr_monitor_mode (uint8_t)          (2 bytes)
+ *          (v2: MLR_MON_* mode; v1: 0 = off, 1 = on, read as Armed)
+ *   [...]  flow_version (uint8_t) + mlr_rec_flow (uint8_t)             (2 bytes)
  *   [end]  uint32_t CRC32 (over everything from offset 0 to here)
  *
  * Loaders gate every trailing versioned block (groups onwards) on
@@ -2999,6 +3003,7 @@ enum {
 	MLR_SCENE_CV2_BYTES = 2,
 	MLR_SCENE_CVT_BYTES = 3,
 	MLR_SCENE_MON_BYTES = 2,
+	MLR_SCENE_FLOW_BYTES = 2,
 	MLR_SCENE_CRC_BYTES = 4,
 	MLR_SCENE_MAX_SERIALIZED_BYTES =
 		MLR_SCENE_HEADER_BYTES +
@@ -3015,6 +3020,7 @@ enum {
 		MLR_SCENE_CV2_BYTES +
 		MLR_SCENE_CVT_BYTES +
 		MLR_SCENE_MON_BYTES +
+		MLR_SCENE_FLOW_BYTES +
 		MLR_SCENE_CRC_BYTES,
 	MLR_SCENE_STAGING_BYTES =
 		((MLR_SCENE_MAX_SERIALIZED_BYTES + MLR_PAGE_SIZE - 1) / MLR_PAGE_SIZE) * MLR_PAGE_SIZE
@@ -3143,9 +3149,13 @@ static uint32_t scene_serialize(void)
 	scene_blob[pos++] = mlr_cv1_target;
 	scene_blob[pos++] = mlr_cv2_target;
 
-	/* input monitor on/off (appended at v1; follows cvt) */
-	scene_blob[pos++] = 1;  /* mon version */
-	scene_blob[pos++] = mlr_monitor_enabled ? 1 : 0;
+	/* input monitor mode (appended at v1; follows cvt) */
+	scene_blob[pos++] = 2;  /* mon version: MLR_MON_* mode */
+	scene_blob[pos++] = mlr_monitor_mode;
+
+	/* record flow (appended at v1; follows mon) */
+	scene_blob[pos++] = 1;  /* flow version */
+	scene_blob[pos++] = mlr_rec_flow;
 
 	/* write data_len */
 	uint32_t data_len = pos - 8;
@@ -3341,8 +3351,19 @@ void MLR_COLD_FUNC mlr_scene_load(void)
 								/* input monitor (follows cvt); older scenes keep the default */
 								if (pos + 2 <= end) {
 									uint8_t mon_version = flash[pos++];
-									(void)mon_version;
-									mlr_monitor_enabled = flash[pos++] != 0;
+									uint8_t mon = flash[pos++];
+									if (mon_version < 2)  /* v1: on/off -> Armed/Off */
+										mlr_monitor_mode = mon ? MLR_MON_ARMED : MLR_MON_OFF;
+									else
+										mlr_monitor_mode = (mon <= MLR_MON_ALWAYS) ? mon : MLR_MONITOR_DEFAULT_MODE;
+
+									/* record flow (follows mon); older scenes: Switch */
+									if (pos + 2 <= end) {
+										uint8_t flow_version = flash[pos++];
+										(void)flow_version;
+										mlr_rec_flow = (flash[pos++] == MLR_REC_FLOW_DIRECT)
+											? MLR_REC_FLOW_DIRECT : MLR_REC_FLOW_SWITCH;
+									}
 								}
 							}
 						}
