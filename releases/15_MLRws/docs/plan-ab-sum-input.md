@@ -655,3 +655,30 @@ fork of the web app, or propose it upstream.
 7. Perf: no change in the max process time.
 
 Size: ~80-120 lines. Low CPU (~10 cycles), +480 B RAM.
+
+## 14. Alignment with mlre (norns), the reference for MLRws
+
+Source: sonocircuit/mlre v2.2 manual (REC PAGE, pp. 5-6) and `mlre.lua`
+(`arm_thresh_rec`, `rec_at_threshold`, `end_oneshot`, the `rec_threshold`
+param). mlre runs on softcut (PCM buffers), so it can punch in anywhere.
+MLRws stores ADPCM in flash, so some behaviours are adapted. Differences
+are marked **(adapted)**.
+
+| mlre | What it does | MLRws plan |
+|---|---|---|
+| **ARM**: one-shot threshold recording | Arms a track. Recording starts when the input level passes `rec threshold` (−40..0 dB, default −12 dB, polled every 10 ms on both inputs). Stopped track → starts at the first step; playing track → starts at the playhead. Ends after **one cycle** (track length or current loop). | **Part E**, updated: threshold adjustable **−40..0 dB, default −12 dB** (hold the col-2 key + Knob Y). The detector listens to the track's selected source (A, B or A+B). Empty or stopped track → a fresh recording, stopped by tapping the arm key or at max length. Playing track with Overdub on → a one-cycle overdub pass that starts at the next wrap **(adapted: ADPCM can't start mid-track without a junction; see C-v2 below)**. |
+| **ALT + ARM**: auto-length | The track length becomes the length of the recorded clip. | This is what a fresh MLRws recording already does. Nothing to add. |
+| **REC** toggle with **dub level** (pre level) and **rec level** per track | Recording writes at the playhead. Dub level = how much old material is kept (0 = replace, 100% = pure overdub). Rec level = input amount. | **Part C**, updated: a **per-track dub level** (replaces the fixed fb = 0.9), saved in the scene. Rec level = Knob X (global, as today). Dub level 0 = overwrite pass. |
+| **ALT + REC**: one-shot recording | Records exactly one cycle, then stops. | Part C: a single-pass overdub *is* one-shot. Continuous passes = holding record (C2). |
+| **Fade-out mode** (MOD + ALT + REC) | Rewrites with silence at the dub level, even with REC off. The loop decays. | Free once Part C exists: a pass with the input muted and dub < 100%. Add as C6 ("decay pass"). Mind the wear: one erase per sector per pass. |
+| **MOD + REC**: undo (auto-backup) | Restores the previous take. | Not planned: no flash space without losing a track (decision taken: 6 tracks, no undo). |
+| Punch-in anywhere | Softcut writes at any position. | **(adapted)**: whole-track passes in v1. **C-v2 (later):** start a pass at any keyframe (every 1024 samples, 43 ms), seeding the encoder from the old keyframe there. At the end of the cycle the stream meets old data, so store a "resync" keyframe index in the header and reload the decoder state at that sample in `fill_pcm_ring_forward`/`seek_fill_raw`. That makes the junction exact. It needs one header field and the page-aligned erase handling of the sector containing the start point. |
+
+### Updated decisions
+- **E1**: threshold −40..0 dB, default −12 dB, adjustable while holding the
+  auto-trigger key (Knob Y). Shown on the input meter (Part D3) so the
+  threshold is visible.
+- **Part C feedback**: a per-track dub level (0-100%, default 90%)
+  instead of the global constant. UI: hold the track's arm key + Knob Y,
+  or the REC page volume columns while Overdub mode is on (decide at
+  implementation, keeping 8x8 in mind).
