@@ -594,3 +594,64 @@ fork of the web app, or propose it upstream.
   play back, capture with an interface).
 - Varispeed sweep with D5: less dull and fewer metallic images.
 - Perf counters before and after each step: no overruns.
+
+## 13. Part E: auto-trigger recording (arm, then the input starts it)
+
+### Behaviour
+- New setting **Auto-trigger**, on a dedicated key: **row 0, col 2**. It's
+  free on both 16-wide and 8x8 according to the row-0 handler
+  (`main.cpp:~718-830`) and the layout comment (`main.cpp:12-18`). Lit =
+  on, dim = off, so the state is always visible. Saved in the scene (a
+  versioned trailing block, like Part B). Verify that `draw_row0_nav`
+  draws nothing on col 2 today.
+- With Auto-trigger on, arm a track as usual (switch at Middle). The arm
+  LED shows "listening" (a distinct blink). The first time the input
+  (after Knob X, from the selected A/B/A+B source) crosses the threshold,
+  recording starts. No switch move is needed.
+- **Pre-roll**: the record path reads the input through a 10 ms delay line
+  (240 samples, 480 B RAM), so the attack that crossed the threshold is
+  captured, not cut off. The delay is always in the record path, so
+  manual starts behave the same.
+- **Stop**: tap the lit arm key. The recording stops and plays at once,
+  like returning the switch to Middle today. Max length still auto-stops.
+  The switch and Pulse In 2 keep working as today. Option (decision E2):
+  auto-stop after N seconds of silence, off by default.
+- After a triggered take the track is disarmed (as today). Decision E3:
+  optionally re-arm automatically for the next track.
+- Works with Overdub (Part C): the trigger starts the pass at the next
+  wrap, as a switch start would.
+- Gridless (later): in gridless record mode, start on signal instead of
+  the switch-Down press.
+
+### Threshold (decision E1)
+- Default fixed at ~−36 dBFS on the post-gain signal (|x| > 64 of 2048).
+  Knob X then also sets the sensitivity.
+- Detector: peak follower with ~1 ms attack, plus a hold-off of ~50 ms
+  after arming, so the arm-key click and noise don't trigger it. ~5 cycles
+  per sample.
+- Later: an adjustable threshold (e.g. hold the col-2 key and turn Knob
+  Y).
+
+### Code
+- `main.cpp`: the col-2 key in the row-0 handler and its LED in
+  `draw_row0_nav`; the delay line before the `scaled` computation
+  (`:~700-712`); the peak follower; the trigger start next to the switch
+  start (`:607-612`). It uses the same guards: `!mlr_flushing`,
+  `!rec_limit_latched`, `rec_start_lockout_samples_ == 0`. A new
+  `rec_auto_gated_` flag mirrors `rec_pulse_gated_`, so the
+  "switch at Middle → stop" rule (`:614`) doesn't stop it at once. The
+  arm-key tap while recording stops it (`handle_rec_arm_col_press`).
+- `mlr.c`: the scene block for the setting.
+- Docs: `panels/grid.md` (Recording, the row-0 chrome section).
+
+### Tests
+1. Auto-trigger off: identical to before.
+2. On: arm, silence → no start; play a note → recording starts with the
+   attack intact (pre-roll).
+3. The arm-key click and low noise don't trigger it (hold-off, threshold).
+4. Tap the arm key → stops and plays; the max length auto-stops.
+5. Switch and Pulse In 2 still work with auto-trigger on and off.
+6. The setting persists across power cycles. 8x8 works.
+7. Perf: no change in the max process time.
+
+Size: ~80-120 lines. Low CPU (~10 cycles), +480 B RAM.
