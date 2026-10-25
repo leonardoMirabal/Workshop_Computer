@@ -19,7 +19,8 @@ own panel: switch, three knobs, CV/Audio/Pulse jacks, and the six LEDs.
 - **Audio Out 1 and Audio Out 2 are both active** as a stereo pair. Each
   track plays at the pan last set for it in grid mode or the sample manager.
   A track that was never panned sits hard on the side of the input it was
-  recorded from (see [Recording](#recording-in-gridless-mode) below).
+  recorded from, and an A+B track plays at full level on both (see
+  [Recording](#recording-in-gridless-mode) below).
 
 
 ## Two switch positions, two roles for the knobs
@@ -133,7 +134,11 @@ starts**:
   the track is stored as channel 1 (plays back on Audio Out 1).
 - Audio In 1 unplugged, Audio In 2 plugged → captures from Audio In 2 and
   the track is stored as channel 2 (plays back on Audio Out 2).
-- Both plugged or neither plugged → captures from Audio In 1 / channel 1.
+- Both plugged → captures Audio In 1 + Audio In 2 summed (A+B). The track
+  plays at full level on both Audio Out 1 and Audio Out 2, and pan is
+  ignored for it. Each input goes in at unity, so turn Knob X down if the sum
+  clips.
+- Neither plugged → captures from Audio In 1 / channel 1.
 
 The source is locked at the moment recording starts; plugging or unplugging
 mid-recording does not switch inputs.
@@ -147,8 +152,8 @@ mid-recording does not switch inputs.
    active track. The active track's LED flashes fast.
 4. **Knob X** during recording is the input gain (and monitor level), exactly
    like the grid-mode armed-record flow. The monitor is routed to the same
-   output (Audio Out 1 or Audio Out 2) the track will play back on, so what
-   you hear while recording matches the post-recording mix.
+   output (Audio Out 1, Audio Out 2, or both for A+B) the track will play
+   back on, so what you hear while recording matches the post-recording mix.
 5. Release the switch from **Down** to stop the recording, or let the track
    fill to its maximum length, at which point it auto-stops. After a brief settling
    delay (~½ second while the new audio is written to flash) the new

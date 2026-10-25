@@ -234,6 +234,8 @@ static bool __attribute__((section(".flashdata.devmode"))) sample_mgr_send_info(
             info_str(&o, " "); info_uint(&o, hdr->adpcm_bytes);
             info_str(&o, " "); info_uint(&o, hdr->num_keyframes);
             info_str(&o, " "); info_int(&o, hdr->record_speed_shift);
+            /* Masked on purpose: an A+B track (MLR_CH_AB = 2) reports as A (0)
+             * until the web sample manager is known to accept 2. */
             info_str(&o, " "); info_uint(&o, hdr->recorded_channel & 0x01u);
             info_str(&o, " "); info_uint(&o, cv1_pitch_enabled);
             info_str(&o, " "); info_uint(&o, hdr->rate_mark);

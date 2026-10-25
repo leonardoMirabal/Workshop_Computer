@@ -147,9 +147,16 @@ The REC page (page 2) is the per-track parameter editor. We will break this page
 
 On all grids, col 0 arms a track for recording. On 16-wide grids, cols 0 and 1 both arm, and also choose which input the track records from: col 0 = Audio In 1, col 1 = Audio In 2. While a track is armed or actively recording, the selected input's LED carries the record-arm flash.
 
-When a track isn't armed, the two keys show its [pan](#pan) instead: key 1 alone is hard to Audio Out 1, key 2 alone is hard to Audio Out 2, and both at half brightness is centre. The display includes any [CV In 1](#cv-inputs) offset, so you can watch it move.
+**A+B input**: a track can also record Audio In 1 and Audio In 2 summed together. The track stays mono, but it plays at full level on **both** Audio Out 1 and Audio Out 2 (dual mono), and [pan](#pan) is ignored for it: the pan mode, the hop and the CV In 1 pan offset have no effect. Filter, level, speed, reverse and loops work as usual. Each input goes in at unity, so two hot signals can clip; turn **Knob X** down to tame them. While armed, the monitor plays the summed inputs on both outputs.
 
-If you have not manually picked an input for a track, MLRws will auto-select the plugged input when exactly one of Audio In 1 or Audio In 2 is connected. With both or neither connected, it keeps the track's previous input. A new recording starts hard to its input's side.
+- **16-wide grids**: hold one arm key (col 0 or col 1) and press the other on the same row. Both keys light, and both carry the record-arm flash while armed or recording. Tapping either key of an armed A+B track disarms it; tapping a single key on an unarmed track arms it on that one input, as usual. On an unarmed A+B track, holding both keys arms it as A+B (there's no pan mode for it). With the switch in a record position, the first key starts the recording on its own input and the second key switches it to A+B the moment it goes down, so press them together. Releasing either key ends a key-gated recording.
+- **8x8 grids**: there is only one arm key, so the input is automatic. With both inputs plugged, arming a track picks A+B, unless an input was picked for it since power-up (on a 16-wide grid, or by a pattern or recall).
+
+When a track isn't armed, the two keys show its [pan](#pan) instead: key 1 alone is hard to Audio Out 1, key 2 alone is hard to Audio Out 2, and both at half brightness is centre. The display includes any [CV In 1](#cv-inputs) offset, so you can watch it move. An A+B track shows both keys fully lit instead.
+
+If you have not manually picked an input for a track, MLRws will auto-select the plugged input when exactly one of Audio In 1 or Audio In 2 is connected. With both connected, 8x8 grids pick A+B and 16-wide grids keep the track's previous input; with neither connected, it keeps the track's previous input. A new recording starts hard to its input's side (A+B tracks play on both).
+
+Older firmware plays an A+B track as an Audio In 1 track. The sample manager lists A+B tracks as channel 1 for now.
 
 More details in [Recording](#recording)
 

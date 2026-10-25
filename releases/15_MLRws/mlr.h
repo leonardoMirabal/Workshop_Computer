@@ -95,6 +95,21 @@ extern "C" {
 #define MLR_RATE_MARK_24K            0x80u  /* audio stored at MLR_SAMPLE_RATE_HZ */
 #define MLR_RATE_MARK_CONVERTING     0x81u  /* 48 -> 24 kHz conversion interrupted */
 
+/* Per-track record source (recorded_channel). A+B records the two inputs
+ * summed into the mono buffer and plays it at unity on both outputs (pan is
+ * ignored). Older firmware masks the byte with 0x01, so an A+B track
+ * plays there as an A track. */
+#define MLR_CH_A               0u   /* Audio In 1 */
+#define MLR_CH_B               1u   /* Audio In 2 */
+#define MLR_CH_AB              2u   /* Audio In 1 + 2 summed, dual-mono out, pan ignored */
+#define MLR_CH_MAX             MLR_CH_AB
+
+/* Unknown channel values fall back to A. */
+static inline uint8_t mlr_channel_clamp(uint8_t ch)
+{
+	return (ch > MLR_CH_MAX) ? (uint8_t)MLR_CH_A : ch;
+}
+
 /* ------------------------------------------------------------------ */
 /* Pattern / recall / scene constants                                 */
 /* ------------------------------------------------------------------ */
@@ -181,7 +196,7 @@ typedef struct {
 	uint32_t              adpcm_bytes;
 	uint32_t              num_keyframes;
 	int8_t                record_speed_shift;  /* speed at time of recording */
-	uint8_t               recorded_channel;    /* 0 = Audio1/Out1, 1 = Audio2/Out2 in dual-mono grid mode. */
+	uint8_t               recorded_channel;    /* MLR_CH_A / MLR_CH_B / MLR_CH_AB: record source (In 1, In 2, In 1 + 2). */
 	uint8_t               rate_mark;           /* MLR_RATE_MARK_*; 0..2 (old pan_class) = 48 kHz audio. */
 	uint8_t               cv1_pitch_mode;      /* 0/0xFF = update CV1 pitch on cuts, 1 = leave CV1 pitch unchanged. */
 	mlr_keyframe_channels_t keyframes[MLR_MAX_KEYFRAMES];
@@ -356,7 +371,8 @@ typedef struct {
 	uint16_t       volume_target;       /* fixed 8.8: target from slot    */
 
 	/* per-track input/output channel routing (set by core 0).
-	 * 0 = Audio1/Out1, 1 = Audio2/Out2. Persisted in the track header. */
+	 * MLR_CH_A = Audio1/Out1, MLR_CH_B = Audio2/Out2, MLR_CH_AB = Audio1 + 2
+	 * summed, unity on both outputs (pan ignored). Persisted in the track header. */
 	uint8_t        recorded_channel;
 	uint8_t        rate_mark;            /* Header rate_mark, persisted as-is. */
 	int8_t         pan;                  /* -MLR_PAN_STEPS..+MLR_PAN_STEPS (grid modes; scene) */

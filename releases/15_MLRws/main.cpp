@@ -18,15 +18,17 @@
  *   Col 14    = ALT modifier
  *
  * Recording: hold col 0 (or col 1 on 16-wide, to select input
- *   channel 2) on a track row + switch up/down.
+ *   channel 2; both keys for A+B) on a track row + switch up/down.
  *   Speed-linked up to 1× — slower tape speeds affect recording and
  *   playback; faster settings remain playback-only.
  *   Records from position 0, variable length up to flash limit.
  *
  * Knob Main      = master output volume
  * Audio In 1/2   = record source (per-track recorded_channel selects
- *                  which input is captured; the other can be left idle)
- * Audio Out 1/2  = mixed playback, split L/R by per-track recorded_channel
+ *                  In 1, In 2, or A+B = both summed into the mono track;
+ *                  on 16-wide grids hold one arm key and press the other)
+ * Audio Out 1/2  = mixed playback, split L/R by per-track pan; A+B tracks
+ *                  play at unity on both (pan ignored)
  */
 
 #include "ComputerCard.h"
@@ -127,6 +129,19 @@ volatile uint32_t mlr_perf_cmd_ack = 0;
 
 /* Monitor fade step per sample (Q8). 256/8 = 32 samples ≈ 1.3 ms fade. */
 #define MLR_MON_FADE_STEP 8
+
+/* Record source for a track's recorded_channel. A+B is a saturating full
+ * sum: each input stays at unity and Knob X tames hot signals. */
+static inline int16_t __not_in_flash_func(record_source_in)(uint8_t ch, int in1, int in2)
+{
+	if (ch == MLR_CH_AB) {
+		int sum = in1 + in2;
+		if (sum >  2047) sum =  2047;
+		if (sum < -2048) sum = -2048;
+		return (int16_t)sum;
+	}
+	return (int16_t)((ch == MLR_CH_B) ? in2 : in1);
+}
 
 /* ------------------------------------------------------------------ */
 /* Pages                                                              */
@@ -685,7 +700,7 @@ public:
 			uint8_t rec_ch = mon_ch_last_;
 			int route_track = (mlr_rec_track >= 0) ? mlr_rec_track : rec_armed_track;
 			if (route_track >= 0) rec_ch = mlr_tracks[route_track].recorded_channel;
-			dry_in = (rec_ch == 1) ? (int16_t)audio_in2 : (int16_t)audio_in1;
+			dry_in = record_source_in(rec_ch, audio_in1, audio_in2);
 		}
 		uint8_t dry_level = (uint8_t)(x_knob_filtered_ >> 4);  /* 0–255, from LPF'd Knob::X */
 		if (mlr_rec_track >= 0) {
@@ -963,7 +978,10 @@ public:
 				/* same pan as the track's playback, so monitoring matches */
 				outL += (in_scaled * (int32_t)mon_gl_last_) >> 15;
 				outR += (in_scaled * (int32_t)mon_gr_last_) >> 15;
-			} else if (mon_ch_last_ == 1) {
+			} else if (mon_ch_last_ == MLR_CH_AB) {
+				outL += in_scaled;
+				outR += in_scaled;
+			} else if (mon_ch_last_ == MLR_CH_B) {
 				outR += in_scaled;
 			} else {
 				outL += in_scaled;
@@ -1727,11 +1745,11 @@ private:
 				gl_record_track_ = gl_active_track_;
 				/* Auto-pick the input jack: if exactly one of Audio1/Audio2 is
 				 * connected, record from that input and set the track's
-				 * recorded_channel to match. With both plugged or neither,
-				 * default to Audio In 1 / channel 0. */
+				 * recorded_channel to match. With both plugged, record the
+				 * sum (A+B, dual mono). With neither, default to Audio In 1. */
 				bool a1 = Connected(Input::Audio1);
 				bool a2 = Connected(Input::Audio2);
-				uint8_t ch = (!a1 && a2) ? 1 : 0;
+				uint8_t ch = (a1 && a2) ? MLR_CH_AB : (!a1 && a2) ? MLR_CH_B : MLR_CH_A;
 				mlr_tracks[gl_record_track_].recorded_channel = ch;
 				mlr_start_record(gl_record_track_);
 				rec_speed_accum = 0;
@@ -1744,9 +1762,8 @@ private:
 		/* Active recording: speed-linked write, auto-stop at max length. */
 		if (gl_recording_active_ && gl_record_track_ >= 0 && gl_record_track_ < MLR_NUM_TRACKS) {
 			/* Read from whichever input was selected at start-of-record. */
-			int16_t dry_in_l = (mlr_tracks[gl_record_track_].recorded_channel == 1)
-				? AudioIn2()
-				: AudioIn1();
+			int16_t dry_in_l = record_source_in(mlr_tracks[gl_record_track_].recorded_channel,
+				(int)AudioIn1(), (int)AudioIn2());
 			uint8_t in_gain = (uint8_t)(KnobVal(Knob::X) >> 4);  /* 0..255 */
 
 			int32_t scaled_l = ((int32_t)dry_in_l * (int32_t)in_gain) >> 8;
@@ -2051,7 +2068,11 @@ private:
 			/* Route the input monitor to whichever output bus the
 			 * track being recorded will play back on, so what you
 			 * hear while recording matches the post-recording mix. */
-			if (mlr_tracks[gl_record_track_].recorded_channel == 1)
+			uint8_t gl_ch = mlr_tracks[gl_record_track_].recorded_channel;
+			if (gl_ch == MLR_CH_AB) {
+				outL += (int32_t)rec_monitor_l;
+				outR += (int32_t)rec_monitor_l;
+			} else if (gl_ch == MLR_CH_B)
 				outR += (int32_t)rec_monitor_l;
 			else
 				outL += (int32_t)rec_monitor_l;
@@ -2485,13 +2506,17 @@ private:
 		int sw_now = SwitchVal();
 		bool rec_pos = (sw_now == Switch::Up || sw_now == Switch::Down);
 
-		/* 16-wide grid: col 0 = ch1, col 1 = ch2. */
+		/* 16-wide grid: col 0 = ch1, col 1 = ch2, both keys on the row = A+B. */
 		if (!small_grid_) {
+			uint8_t ch = mlr_tracks[track].recorded_channel;
+			bool other_held = (grid.heldRowMask((uint8_t)(track + 1)) & (1u << (column ^ 1))) != 0;
 			/* Hard-panned track, nothing armed/recording, switch in the middle:
 			 * the other side's arm key hops it across instead of arming, so
-			 * playback carries on. The same side's key still arms. */
+			 * playback carries on. The same side's key still arms. A+B
+			 * ignores pan, so it never hops, nor does the A+B key pair. */
 			int pan = mlr_tracks[track].pan;
-			bool hop_ok = mlr_pan_enabled && !rec_pos && rec_armed_track < 0 && mlr_rec_track < 0;
+			bool hop_ok = mlr_pan_enabled && !rec_pos && rec_armed_track < 0 && mlr_rec_track < 0 &&
+			              ch != MLR_CH_AB && !other_held;
 			if (hop_ok && pan == -MLR_PAN_STEPS && column == 1) {
 				group_set_pan(track, MLR_PAN_STEPS);
 				return;
@@ -2500,14 +2525,20 @@ private:
 				group_set_pan(track, -MLR_PAN_STEPS);
 				return;
 			}
-			if (rec_armed_track == track &&
-			    mlr_tracks[track].recorded_channel != (uint8_t)column) {
+			if (other_held) {
+				/* Hold one arm key, press the other: record In 1 + In 2. An
+				 * armed or recording row stays so (a punch-in started by the
+				 * first key switches to the sum); otherwise arm it below. */
+				set_track_recorded_channel(track, MLR_CH_AB, true);
+				if (rec_armed_track == track || mlr_rec_track == track) return;
+			} else if (rec_armed_track == track && ch != MLR_CH_AB &&
+			           ch != (uint8_t)column) {
 				set_track_recorded_channel(track, (uint8_t)column, true);
 				return;
-			}
-			if (rec_armed_track != track) {
+			} else if (rec_armed_track != track) {
 				set_track_recorded_channel(track, (uint8_t)column, true);
 			}
+			/* Armed A+B (both keys lit): a tap on either key disarms below. */
 		}
 
 		if (rec_pos && rec_armed_track < 0 && mlr_rec_track < 0 && !mlr_flushing && !rec_limit_latched && rec_start_lockout_samples_ == 0) {
@@ -2588,7 +2619,7 @@ private:
 	void __not_in_flash("set_track_recorded_channel") set_track_recorded_channel(int track, uint8_t channel, bool persist_existing)
 	{
 		if (track < 0 || track >= MLR_NUM_TRACKS) return;
-		channel &= 0x01;
+		channel = mlr_channel_clamp(channel);
 		bool changed = (mlr_tracks[track].recorded_channel != channel);
 		mlr_set_recorded_channel(track, channel);
 		mlr_tracks[track].channel_user_chosen = true;
@@ -2615,13 +2646,16 @@ private:
 
 		/* Plug auto-detect: if the user has not explicitly picked a channel
 		 * for this track, and exactly one of Audio1/Audio2 is connected,
-		 * auto-select that channel. With both or neither plugged, leave the
-		 * track's previous recorded_channel in place. */
+		 * auto-select that channel. With both plugged, 8x8 grids (one arm
+		 * key, no way to pick) record A+B; 16-wide grids, and neither
+		 * plugged, leave the track's previous recorded_channel in place.
+		 * The setter keeps the A+B unity gains in step. */
 		if (track >= 0 && !mlr_tracks[track].channel_user_chosen) {
 			bool a1 = Connected(Input::Audio1);
 			bool a2 = Connected(Input::Audio2);
-			if (a1 && !a2)      mlr_tracks[track].recorded_channel = 0;
-			else if (!a1 && a2) mlr_tracks[track].recorded_channel = 1;
+			if (a1 && a2 && small_grid_) mlr_set_recorded_channel(track, MLR_CH_AB);
+			else if (a1 && !a2)          mlr_set_recorded_channel(track, MLR_CH_A);
+			else if (!a1 && a2)          mlr_set_recorded_channel(track, MLR_CH_B);
 		}
 	}
 
@@ -2863,9 +2897,12 @@ private:
 
 	/* REC page, 16-wide, nothing armed/recording, switch in the middle: holding
 	 * both arm keys on a row enters pan mode for it; releasing either leaves.
-	 * Swallows those arm-key events so they never arm or copy. */
+	 * Swallows those arm-key events so they never arm or copy. A+B rows ignore
+	 * pan, so there the two keys pick A+B instead (handle_rec_arm_col_press). */
 	bool pan_gesture_consumed_ = false;
 	int  pan_exit_track_ = -1;  /* row whose arm keys are still swallowed after pan mode */
+	int  arm_gesture_track_ = -1;  /* row whose arm-key hold began armed/recording: its
+	                                * second key picks A+B, even if the first disarmed it */
 	void __not_in_flash("process_pan_gesture") process_pan_gesture()
 	{
 		pan_gesture_consumed_ = false;
@@ -2886,9 +2923,13 @@ private:
 			return;
 		}
 
+		if ((grid.heldRowMask((uint8_t)row) & 0x3u) != 0x3u)  /* first arm key of a hold */
+			arm_gesture_track_ = (rec_armed_track == track || mlr_rec_track == track) ? track : -1;
+
 		bool rec_pos = (SwitchVal() == Switch::Up || SwitchVal() == Switch::Down);
 		if (rec_pos || rec_armed_track >= 0 || mlr_rec_track >= 0 || delete_action_held()) return;
 		if ((grid.heldRowMask((uint8_t)row) & 0x3u) != 0x3u) return;
+		if (track == arm_gesture_track_ || mlr_tracks[track].recorded_channel == MLR_CH_AB) return;
 		pan_mode_track_ = (int8_t)track;
 		pan_exit_track_ = track;
 		reset_copy_gesture();  /* the first arm key started a copy/arm; cancel it */
@@ -3180,6 +3221,8 @@ private:
 
 		if (grid.keyDown()) {
 			if (!eligible) return;
+			/* Second key of an arm hold that began armed: A+B, not a copy. */
+			if (!small_grid_ && track == arm_gesture_track_) return;
 			if (copy_source_track_ < 0) {
 				if (!mlr_tracks[track].has_content) return;
 				copy_source_track_ = track;
@@ -3198,6 +3241,11 @@ private:
 				copy_gesture_touched_other_ = true;
 				if (!mlr_tracks[track].has_content)
 					copy_target_mask_ |= bit;
+			} else if (column != copy_source_column_ && !copy_gesture_touched_other_ &&
+			           !copy_gesture_committed_) {
+				/* The source row's other arm key (16-wide): arm A+B, not a copy. */
+				reset_copy_gesture();
+				handle_rec_arm_col_press(track, column);
 			}
 			return;
 		}
@@ -3758,6 +3806,11 @@ private:
 				if (!has && !armed && !actively_rec) {
 					col0_bright = state_bright;
 					col1_bright = state_bright;
+				} else if (ch == MLR_CH_AB) {
+					/* A+B: both keys carry the state (arm flash, or full when
+					 * idle; no pan display, since pan is ignored). */
+					col0_bright = state_bright;
+					col1_bright = state_bright;
 				} else if (mlr_pan_enabled && !armed && !actively_rec) {
 					/* Output pan across the two keys: hard left = key 1 only
 					 * (like dual-mono channel 1), centre = both at half. */
@@ -3772,8 +3825,8 @@ private:
 						other    = 2;
 						selected = (uint8_t)(state_bright - 1);
 					}
-					if (ch == 1) { col0_bright = other;    col1_bright = selected; }
-					else         { col0_bright = selected; col1_bright = other;    }
+					if (ch == MLR_CH_B) { col0_bright = other;    col1_bright = selected; }
+					else                { col0_bright = selected; col1_bright = other;    }
 				}
 				if ((copy_flash_mask_ & (1u << t)) && copy_flash_samples_remaining_ > 0) {
 					bool on = (copy_flash_samples_remaining_ / copy_flash_period_) & 1;

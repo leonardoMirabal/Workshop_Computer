@@ -854,12 +854,17 @@ int __not_in_flash_func(mlr_pan_effective_q8)(int track)
 }
 
 /* Recompute target gains from the (gliding) base pan + CV offset. Gains come
- * off the equal-power table at every glide position, so a sweep holds level. */
+ * off the equal-power table at every glide position, so a sweep holds level.
+ * A+B tracks are dual mono: unity on both outputs, pan ignored. */
 static void __not_in_flash_func(pan_update_gains)(mlr_track_t *tr)
 {
-	int e = pan_effective_q8(tr);
-	tr->pan_gl = pan_gain_interp(e + MLR_PAN_STEPS * 256);
-	tr->pan_gr = pan_gain_interp(MLR_PAN_STEPS * 256 - e);
+	if (tr->recorded_channel == MLR_CH_AB) {
+		tr->pan_gl = tr->pan_gr = 32768u;
+	} else {
+		int e = pan_effective_q8(tr);
+		tr->pan_gl = pan_gain_interp(e + MLR_PAN_STEPS * 256);
+		tr->pan_gr = pan_gain_interp(MLR_PAN_STEPS * 256 - e);
+	}
 	if (!tr->playing) {  /* nothing audible to slew */
 		tr->pan_gl_cur = tr->pan_gl;
 		tr->pan_gr_cur = tr->pan_gr;
@@ -880,7 +885,9 @@ void __not_in_flash_func(mlr_set_pan_cv)(int track, int offset_q8)
 int __not_in_flash_func(mlr_pan_default)(int track)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return -MLR_PAN_STEPS;
-	return (mlr_tracks[track].recorded_channel & 0x01) ? MLR_PAN_STEPS : -MLR_PAN_STEPS;
+	uint8_t ch = mlr_tracks[track].recorded_channel;
+	if (ch == MLR_CH_AB) return 0;  /* pan is ignored; centre keeps the hop sane */
+	return (ch == MLR_CH_B) ? MLR_PAN_STEPS : -MLR_PAN_STEPS;
 }
 
 void __not_in_flash_func(mlr_set_pan)(int track, int pan)
@@ -1009,14 +1016,16 @@ void __not_in_flash_func(mlr_set_lpf_pos_mask)(uint8_t mask, uint32_t pos)
 void __not_in_flash_func(mlr_set_recorded_channel)(int track, uint8_t channel)
 {
 	if (track < 0 || track >= MLR_NUM_TRACKS) return;
-	channel &= 0x01;
+	channel = mlr_channel_clamp(channel);
 	mlr_track_t *tr = &mlr_tracks[track];
 
 	/* Playing modes: the channel only picks the record input; pan sets the
-	 * output, so there's nothing audible to fade. */
+	 * output, so there's nothing audible to fade. A+B forces unity gains, so
+	 * refresh them on every change (pan_slew smooths a playing track). */
 	if (mlr_pan_enabled || !tr->has_content || !tr->playing || tr->stop_pending) {
 		tr->recorded_channel = channel;
 		tr->channel_swap_pending = false;
+		pan_update_gains(tr);
 		return;
 	}
 
@@ -1095,7 +1104,7 @@ void MLR_COLD_FUNC mlr_init(void)
 			tr->length_bytes   = hdr->adpcm_bytes;
 			tr->num_keyframes  = hdr->num_keyframes;
 			tr->record_speed_shift = hdr->record_speed_shift;
-			tr->recorded_channel   = hdr->recorded_channel & 0x01;
+			tr->recorded_channel   = mlr_channel_clamp(hdr->recorded_channel);
 			tr->rate_mark          = hdr->rate_mark;
 			tr->cv1_pitch_enabled  = (hdr->cv1_pitch_mode == MLR_CV1_PITCH_ENABLED_MODE);
 			tr->playing        = false;
@@ -1190,7 +1199,7 @@ void MLR_COLD_FUNC mlr_rescan_track(int track)
 		tr->length_bytes   = hdr->adpcm_bytes;
 		tr->num_keyframes  = hdr->num_keyframes;
 		tr->record_speed_shift = hdr->record_speed_shift;
-		tr->recorded_channel   = hdr->recorded_channel & 0x01;
+		tr->recorded_channel   = mlr_channel_clamp(hdr->recorded_channel);
 		tr->rate_mark          = hdr->rate_mark;
 		tr->cv1_pitch_enabled  = (hdr->cv1_pitch_mode == MLR_CV1_PITCH_ENABLED_MODE);
 		tr->playhead       = 0;
@@ -1560,8 +1569,9 @@ static inline void __not_in_flash_func(mix_track_route)(mlr_track_t *tr, int32_t
 	int32_t *mixL, int32_t *mixR)
 {
 	if (!mlr_pan_enabled) {
-		if (tr->recorded_channel == 1) *mixR += s;
-		else                           *mixL += s;
+		if (tr->recorded_channel == MLR_CH_AB)     { *mixL += s; *mixR += s; }
+		else if (tr->recorded_channel == MLR_CH_B) *mixR += s;
+		else                                       *mixL += s;
 		return;
 	}
 
@@ -1851,6 +1861,7 @@ static int32_t __not_in_flash_func(mlr_play_mix_dual_sum)(int32_t *out_right)
 							if (tr->channel_swap_pending) {
 								tr->recorded_channel = tr->pending_channel;
 								tr->channel_swap_pending = false;
+								pan_update_gains(tr);
 							}
 							tr->fade_in_count = MLR_FADE_SAMPLES;
 							transition_update_track_state(tr);
@@ -2312,7 +2323,7 @@ static void __not_in_flash_func(event_exec)(const mlr_event_t *e)
 		break;
 	case MLR_EVT_CHANNEL:
 		if (e->track < MLR_NUM_TRACKS) {
-			mlr_set_recorded_channel(e->track, (uint8_t)e->param_a & 0x01u);
+			mlr_set_recorded_channel(e->track, mlr_channel_clamp((uint8_t)e->param_a));
 			mlr_tracks[e->track].channel_user_chosen = true;
 		}
 		break;
@@ -2802,7 +2813,7 @@ void __not_in_flash_func(mlr_recall_task)(void)
 					break;
 				case 2:
 					emitted = recall_snapshot_add(MLR_EVT_CHANNEL, recall_snapshot_track,
-						(int8_t)(tr->recorded_channel & 0x01), 0);
+						(int8_t)mlr_channel_clamp(tr->recorded_channel), 0);
 					recall_snapshot_track_step = 3;
 					break;
 				case 3:
@@ -4278,7 +4289,7 @@ static void write_track_header(int t, bool start_playback)
 	hdr->adpcm_bytes         = tr->length_bytes;
 	hdr->num_keyframes       = tr->num_keyframes;
 	hdr->record_speed_shift  = tr->record_speed_shift;
-	hdr->recorded_channel    = (uint8_t)(tr->recorded_channel & 0x01);
+	hdr->recorded_channel    = mlr_channel_clamp(tr->recorded_channel);
 	hdr->rate_mark           = tr->rate_mark;
 	hdr->cv1_pitch_mode      = tr->cv1_pitch_enabled ? MLR_CV1_PITCH_ENABLED_MODE : MLR_CV1_PITCH_DISABLED_MODE;
 
@@ -4380,7 +4391,7 @@ static void copy_finish_track(void)
 	hdr->adpcm_bytes         = src->length_bytes;
 	hdr->num_keyframes       = src->num_keyframes;
 	hdr->record_speed_shift  = src->record_speed_shift;
-	hdr->recorded_channel    = (uint8_t)(src->recorded_channel & 0x01);
+	hdr->recorded_channel    = mlr_channel_clamp(src->recorded_channel);
 	hdr->rate_mark           = src->rate_mark;
 	hdr->cv1_pitch_mode      = src->cv1_pitch_enabled ? MLR_CV1_PITCH_ENABLED_MODE : MLR_CV1_PITCH_DISABLED_MODE;
 	memcpy(hdr->keyframes, track_keyframes(copy_src_track),
@@ -4395,7 +4406,7 @@ static void copy_finish_track(void)
 	dst->length_bytes       = src->length_bytes;
 	dst->num_keyframes      = src->num_keyframes;
 	dst->record_speed_shift = src->record_speed_shift;
-	dst->recorded_channel   = src->recorded_channel & 0x01;
+	dst->recorded_channel   = mlr_channel_clamp(src->recorded_channel);
 	mlr_set_pan(copy_dst_track, src->pan);
 	mlr_set_lpf(copy_dst_track, src->lpf_slot);
 	dst->rate_mark          = src->rate_mark;
