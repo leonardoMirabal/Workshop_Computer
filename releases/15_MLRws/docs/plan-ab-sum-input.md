@@ -503,3 +503,94 @@ writes **new** data behind it, in the same flash region.
 7. Power-pull mid-pass → boot rebuilds keyframes, the track plays (one
    glitch max).
 8. A+B source and monitor-off combinations.
+
+## 12. Part D: best audio quality with 6 tracks
+
+Hard limits that don't change: 24 kHz sample rate (CPU budget), 12-bit
+ADC/DAC (hardware), 4-bit IMA ADPCM storage (keeps 26 s × 6 tracks). The
+ADC DNL correction already exists (`ComputerCard.h:693-698`). Everything
+below keeps the storage format, so existing tracks and the web app keep
+working. First local build of this branch: RAM 242,996 B of 256 KB used
+(linker), so ~19 KB is free. That's more than the study's estimate.
+
+Ordered by value ÷ risk.
+
+### D1. Output path: keep 16-bit precision to the DAC, round once, dither
+Today the mixer works at 16 bits, then truncates to 12 bits
+(`mlr_play_mix_dual`, `mlr.c:~1923`, `>> 4`). **After that** the monitor
+is added and the master level is applied at 12 bits (`main.cpp:~990`:
+`outL = (outL * master_level) >> 8`). At low master settings that throws
+away more bits, so quiet output gets grainy.
+- Return the mix at 16 bits (Q4). Add the monitor (shifted `<< 4`) and the
+  master level in the 16-bit domain, then do a **single** conversion to
+  12 bits right before `AudioOut1/2`.
+- Use TPDF dither on that conversion: two LCG randoms per channel, ~15-25
+  cycles per sample total. That removes truncation distortion on quiet
+  material and fade tails. Option: 1st-order noise shaping (error
+  feedback). It's cheap, but at 24 kHz the shaped noise lands at 6-12 kHz,
+  so do a listening test before enabling it.
+- Same treatment in the gridless output (`main.cpp:~2068-2080`).
+- Soft clip (`mlr.c:1895-1920`) unchanged.
+
+### D2. Record path: apply Knob X gain at 16 bits
+Today the gain is applied to the 12-bit input (`main.cpp:~706`), then
+`<< 4` inside `mlr_record_sample` (`mlr.c:1312`). At low Knob X settings
+that drops resolution before encoding. Apply the gain to `in << 4`
+instead, and add `mlr_record_sample16()` taking a 16-bit sample (the old
+API stays as a wrapper). Cost ~0. Same in gridless.
+
+### D3. Input level meter while armed (helps "record hot")
+ADPCM noise is relative to the step size, which follows the signal level:
+quiet recordings sound grittier. Show input peak level on the armed row
+while armed and not recording, e.g. on the REC page volume columns (core
+1 LED render only; core 0 keeps a peak-hold value). Free on core 0
+(~5 cycles for the peak). This is the biggest practical win.
+
+### D4. Smarter ADPCM encoder (decoder unchanged)
+Standard IMA picks each nybble greedily. A small look-ahead picks the
+nybble that minimises the error over this sample **and** the next one.
+- **Light variant (recommended first):** try 3 candidates (greedy n, n±1
+  in magnitude), then encode the next sample greedily for each, and keep
+  the lowest total squared error. ~150-250 extra cycles per recorded
+  sample (estimated).
+- **Full variant:** all 16 candidates, ~900+ cycles. Only if measurements
+  allow.
+- Benefit (estimated, to verify by measuring SNR on test material): a few
+  dB less noise. It matters most for **overdub** (Part C), where every
+  pass re-encodes.
+- Applies to live recording and overdub on core 0. The boot-time 48→24 kHz
+  converter (`mlr.c:4754`) can use the full variant for free (core 1,
+  one-time).
+
+### D5. 4-point cubic (Hermite) interpolation for varispeed
+The slow path uses linear interpolation at fractional speeds
+(`linear_interp_q8`, `mlr.c:1503, 1822`), which sounds dull and leaks
+images. Hermite needs `x-1, x0, x1, x2` from the ring: ~40 extra cycles
+per track on the slow path, ×6 = ~240 worst case. Integer speeds (fast
+path) are unaffected. The wrap/seek preview builders on core 1
+(`mlr.c:3954, 4013`) can switch too.
+Note: at speeds > 1×, aliasing from skipping samples remains. The
+per-track ladder LPF can be used as an anti-alias filter by hand (future:
+auto-follow the speed).
+
+### D6. Web-app encoder (other repo, `dessertplanet/MLRws-web`)
+Uploaded samples can be encoded offline with a full trellis/look-ahead
+search. That's the best possible ADPCM at zero firmware cost. Do it in a
+fork of the web app, or propose it upstream.
+
+### Order and gates
+1. D1 + D2 + D3: low risk, a few dozen lines each.
+2. Measure with `-DMLR_PERF_PROFILING=ON`: `mlr_perf_process_sample_max_us`,
+   `..._ui_max_us`, `..._overruns` with 6 tracks at fractional speeds, LPF
+   gliding and recording. Record the headroom.
+3. D4 light variant and D5 only if the measured worst case stays under
+   ~36 µs of the 41.7 µs budget.
+4. D6 independent.
+
+### Tests
+- Quiet material at low master level: smoother tails with D1 (compare by
+  ear, or a recorded sine at −40 dBFS through an audio interface).
+- Record a sine at low and high Knob X: the D2/D4 SNR difference (record,
+  play back, capture with an interface).
+- Varispeed sweep with D5: less dull and fewer metallic images.
+- Perf counters before and after each step: no overruns.

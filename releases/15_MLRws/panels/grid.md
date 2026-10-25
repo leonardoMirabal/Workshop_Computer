@@ -156,7 +156,7 @@ When a track isn't armed, the two keys show its [pan](#pan) instead: key 1 alone
 
 If you have not manually picked an input for a track, MLRws will auto-select the plugged input when exactly one of Audio In 1 or Audio In 2 is connected. With both connected, 8x8 grids pick A+B and 16-wide grids keep the track's previous input; with neither connected, it keeps the track's previous input. A new recording starts hard to its input's side (A+B tracks play on both).
 
-Older firmware plays an A+B track as an Audio In 1 track. The sample manager lists A+B tracks as channel 1 for now.
+Older firmware plays an A+B track as an Audio In 1 track. The sample manager lists A+B tracks as Audio In 1 tracks for now.
 
 More details in [Recording](#recording)
 
